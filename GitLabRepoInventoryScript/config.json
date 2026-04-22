@@ -1,0 +1,18 @@
+{
+    "_token_scope_required": "read_api (mandatory) + read_registry (for container registry counts). Create at: <gitlab-url>/-/user_settings/personal_access_tokens",
+    "gitlab": {
+        "url": "https://gitlab.com",
+        "token": "xxxxxxxxxxxxxxx",
+        "per_page": 100,
+        "verify_ssl": true
+    },
+    "output": {
+        "csv_file": "gitlab_repo_inventory.csv"
+    },
+    "filters": {
+        "membership_only": true
+    },
+    "performance": {
+        "max_workers": 20
+    }
+}
