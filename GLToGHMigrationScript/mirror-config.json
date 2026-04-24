@@ -21,6 +21,7 @@
     "exclude": [""]
   },
   "migration": {
+    "rename_default_branch_to_main": true,
     "max_workers": 5,
     "clone_timeout_seconds": 7200,
     "push_timeout_seconds": 7200,

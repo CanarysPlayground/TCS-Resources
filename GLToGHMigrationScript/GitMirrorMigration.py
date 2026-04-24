@@ -99,6 +99,18 @@ _VIS_ICONS = {"private": "\U0001f512", "internal": "\U0001f465", "public": "\U00
 def _fmt_ts() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
+def _fmt_duration(seconds: float) -> str:
+    """Return a human-readable duration: 'Xh Ym Zs', 'Ym Zs', or 'Zs'."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s   = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
 # ---------------------------------------------------------------------------
 # Colored console logging
 # ---------------------------------------------------------------------------
@@ -497,6 +509,7 @@ class MigrationConfig:
     push_timeout: int = 7200
     git_max_retries: int = 3
     dry_run: bool = False                              # log intent only; skip all writes
+    rename_default_branch: bool = False                # if True, rename source default branch to 'main' on GitHub
     branch_include: list[str] = field(default_factory=list)  # regex include patterns; empty = all
     branch_exclude: list[str] = field(default_factory=list)  # regex exclude patterns; empty = none
     min_free_disk_gb: float = 10.0                     # min free temp-dir space before starting
@@ -508,14 +521,19 @@ class _RepoResult:
     source: str              # namespace/project
     target: str              # org/target_name
     status: str              # "succeeded" | "failed" | "skipped" | "dry-run"
-    default_branch: str      # actual source default branch (empty if unknown)
+    default_branch: str      # actual default branch (post-rename if applicable)
     error: str               # error message on failure (empty on success)
     duration_seconds: float  # wall-clock seconds for this repo
     completed_at: str        # "YYYY-MM-DD HH:MM:SS" human-readable timestamp
+    visibility: str = ""              # visibility applied on GitHub
+    gh_repo_url: str = ""             # clickable GitHub repo URL
     branch_count: int = 0             # branches pushed (post-filter)
     head_commit_sha: str = ""         # HEAD commit SHA from source bare clone
     gh_branch_count: int = 0          # branch count on GitHub after push
     gh_head_commit_sha: str = ""      # HEAD commit SHA on GitHub after push
+    tag_count: int = 0                # tag count from source bare clone
+    gh_tag_count: int = 0             # tag count on GitHub after push
+    default_branch_renamed: bool = False  # True if source default branch was renamed to 'main'
     validation_status: str = ""       # "match" | "mismatch" | "unknown" | "dry-run"
     validation_notes: str = ""        # human-readable diff notes
 
@@ -530,6 +548,10 @@ class _MirrorResult:
     head_commit_sha: str = ""
     gh_branch_count: int = 0
     gh_head_commit_sha: str = ""
+    tag_count: int = 0
+    gh_tag_count: int = 0
+    gh_repo_url: str = ""
+    default_branch_renamed: bool = False
     validation_status: str = ""
     validation_notes: str = ""
 
@@ -698,6 +720,16 @@ def _count_branches(mirror_dir: Path) -> int:
     return len([b for b in out.splitlines() if b.strip()]) if code == 0 else 0
 
 
+def _count_tags(mirror_dir: Path) -> int:
+    """Count refs/tags/ entries in a bare clone."""
+    code, out, _ = _run_git(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/tags/"],
+        cwd=mirror_dir,
+        timeout=30,
+    )
+    return len([t for t in out.splitlines() if t.strip()]) if code == 0 else 0
+
+
 def _get_head_commit_sha(mirror_dir: Path, branch: str) -> str:
     """Return the full commit SHA at refs/heads/<branch> in a bare clone."""
     if not branch:
@@ -747,6 +779,22 @@ def _get_github_branch_count(client: GitHubClient, org: str, repo: str) -> int:
     return total
 
 
+def _get_github_tag_count(client: GitHubClient, org: str, repo: str) -> int:
+    """Return the total number of tags in a GitHub repo (handles pagination)."""
+    page, total = 1, 0
+    while True:
+        st, resp = client.request(
+            "GET", f"/repos/{org}/{repo}/tags?per_page=100&page={page}"
+        )
+        if st != 200 or not isinstance(resp, list):
+            break
+        total += len(resp)
+        if len(resp) < 100:
+            break
+        page += 1
+    return total
+
+
 def _get_github_head_commit_sha(
     client: GitHubClient, org: str, repo: str, branch: str
 ) -> str:
@@ -764,8 +812,16 @@ def _compute_validation(
     head_sha: str,
     gh_branch_count: int,
     gh_head_sha: str,
+    tag_count: int = 0,
+    gh_tag_count: int = 0,
 ) -> tuple[str, str]:
-   
+    """Compare source bare-clone data against GitHub post-push data.
+
+    Returns (validation_status, notes):
+        "match"    -- all checks pass
+        "mismatch" -- at least one value differs (notes describes what)
+        "unknown"  -- GitHub data was not available (API error)
+    """
     if not gh_branch_count and not gh_head_sha:
         return "unknown", "GitHub validation data unavailable"
     notes: list[str] = []
@@ -773,6 +829,8 @@ def _compute_validation(
         notes.append(f"branch count: source={branch_count} github={gh_branch_count}")
     if head_sha and gh_head_sha and head_sha != gh_head_sha:
         notes.append(f"HEAD SHA: source={head_sha[:8]}... github={gh_head_sha[:8]}...")
+    if tag_count and gh_tag_count and tag_count != gh_tag_count:
+        notes.append(f"tag count: source={tag_count} github={gh_tag_count}")
     return ("mismatch", "; ".join(notes)) if notes else ("match", "")
 
 
@@ -911,12 +969,32 @@ def _mirror_repo(
         _filter_branches(mirror_dir, spec.branch_include, spec.branch_exclude, name)
 
         branch_count   = _count_branches(mirror_dir)
+        tag_count      = _count_tags(mirror_dir)
         default_branch = _get_default_branch(mirror_dir)
         head_sha       = _get_head_commit_sha(mirror_dir, default_branch)
         if default_branch:
-            log.info(f"[{name}] Default branch: '{default_branch}' | {branch_count} branch(es)")
+            log.info(f"[{name}] Default branch: '{default_branch}' | {branch_count} branch(es) | {tag_count} tag(s)")
         else:
             log.warning(f"[{name}] Could not determine source default branch")
+
+        # Optional: rename the source default branch to 'main' before pushing.
+        # This renames the ref in the bare clone so the mirror push lands as 'main'.
+        renamed = False
+        if config.rename_default_branch and default_branch and default_branch != "main":
+            rc1, _, e1 = _run_git(
+                ["git", "update-ref", "refs/heads/main", f"refs/heads/{default_branch}"],
+                cwd=mirror_dir, timeout=15,
+            )
+            rc2, _, e2 = _run_git(
+                ["git", "update-ref", "-d", f"refs/heads/{default_branch}"],
+                cwd=mirror_dir, timeout=15,
+            )
+            if rc1 == 0 and rc2 == 0:
+                log.info(f"[{name}] Branch renamed: '{default_branch}' -> 'main' (pre-push)")
+                default_branch = "main"
+                renamed = True
+            else:
+                log.warning(f"[{name}] Could not rename branch to 'main': {e1 or e2} -- pushing as-is")
 
         log.info(f"[{name}] Pushing to {safe_push}")
         ok, err = _git_with_retry(
@@ -934,9 +1012,13 @@ def _mirror_repo(
         if default_branch:
             _set_github_default_branch(client, spec.target_org, name, default_branch)
 
+        gh_repo_url = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
         gh_branches = _get_github_branch_count(client, spec.target_org, name)
+        gh_tags     = _get_github_tag_count(client, spec.target_org, name)
         gh_head_sha = _get_github_head_commit_sha(client, spec.target_org, name, default_branch)
-        v_status, v_notes = _compute_validation(branch_count, head_sha, gh_branches, gh_head_sha)
+        v_status, v_notes = _compute_validation(
+            branch_count, head_sha, gh_branches, gh_head_sha, tag_count, gh_tags
+        )
 
         return _MirrorResult(
             ok=True,
@@ -945,6 +1027,10 @@ def _mirror_repo(
             head_commit_sha=head_sha,
             gh_branch_count=gh_branches,
             gh_head_commit_sha=gh_head_sha,
+            tag_count=tag_count,
+            gh_tag_count=gh_tags,
+            gh_repo_url=gh_repo_url,
+            default_branch_renamed=renamed,
             validation_status=v_status,
             validation_notes=v_notes,
         )
@@ -1186,6 +1272,10 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
     if dry_run:
         log.info("DRY RUN mode enabled -- no repos will be created or pushed")
 
+    rename_default_branch = bool(mig.get("rename_default_branch_to_main", False))
+    if rename_default_branch:
+        log.info("rename_default_branch_to_main enabled -- source default branch will be renamed to 'main'")
+
     min_free_disk_gb = float(mig.get("min_free_disk_gb", _DEFAULT_MIN_FREE_DISK_GB))
 
     return MigrationConfig(
@@ -1200,6 +1290,7 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
         push_timeout=int(mig.get("push_timeout_seconds", _DEFAULT_PUSH_TIMEOUT)),
         git_max_retries=raw_retries,
         dry_run=dry_run,
+        rename_default_branch=rename_default_branch,
         branch_include=branch_include,
         branch_exclude=branch_exclude,
         min_free_disk_gb=min_free_disk_gb,
@@ -1286,7 +1377,7 @@ def _preflight_checks(config: MigrationConfig, client: GitHubClient) -> None:
 # ===========================================================================
 
 def _compute_metrics(results: list[_RepoResult]) -> dict:
-    """Compute timing percentiles for all processed (non-skipped) repos."""
+    """Compute basic timing stats for all processed (non-skipped) repos."""
     durations = sorted(
         r.duration_seconds for r in results
         if r.status not in ("skipped", "dry-run") and r.duration_seconds > 0
@@ -1294,18 +1385,11 @@ def _compute_metrics(results: list[_RepoResult]) -> dict:
     if not durations:
         return {}
     n = len(durations)
-
-    def _pct(p: float) -> float:
-        return round(durations[min(int(n * p / 100), n - 1)], 1)
-
     return {
         "count": n,
         "min_seconds": round(durations[0], 1),
         "max_seconds": round(durations[-1], 1),
         "mean_seconds": round(sum(durations) / n, 1),
-        "p50_seconds": _pct(50),
-        "p95_seconds": _pct(95),
-        "p99_seconds": _pct(99),
     }
 
 
@@ -1342,23 +1426,32 @@ def _write_reports(
             "failed": len(failed),
             "skipped_already_done": len(skipped),
             "dry_run": len(dry_run),
+            "success_rate": (
+                f"{len(succeeded)/( len(succeeded)+len(failed) )*100:.1f}%"
+                if (len(succeeded) + len(failed)) else "N/A"
+            ),
         },
         "timing_metrics": _compute_metrics(results),
         "repos": [
             {
                 "source": r.source,
                 "target": r.target,
+                "gh_repo_url": r.gh_repo_url,
                 "status": r.status,
+                "visibility": r.visibility,
                 "default_branch": r.default_branch,
+                "default_branch_renamed": r.default_branch_renamed,
                 "branch_count": r.branch_count,
                 "head_commit_sha": r.head_commit_sha,
                 "gh_branch_count": r.gh_branch_count,
                 "gh_head_commit_sha": r.gh_head_commit_sha,
+                "tag_count": r.tag_count,
+                "gh_tag_count": r.gh_tag_count,
                 "validation_status": r.validation_status,
                 "validation_notes": r.validation_notes,
                 "error": r.error,
                 "duration_seconds": round(r.duration_seconds, 1),
-                "duration_minutes": round(r.duration_seconds / 60, 3),
+                "duration_minutes": round(r.duration_seconds / 60, 2),
                 "completed_at": r.completed_at,
             }
             for r in results
@@ -1428,6 +1521,7 @@ def _write_xlsx(
     }
     LEFT   = Alignment(horizontal="left",   vertical="center")
     CENTER = Alignment(horizontal="center", vertical="center")
+    WRAP   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
     def _header_row(ws, headers: list) -> None:
         for ci, hdr in enumerate(headers, 1):
@@ -1442,113 +1536,251 @@ def _write_xlsx(
         for ci, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
 
-    wb = openpyxl.Workbook()
+    def _hyperlink_cell(ws, row: int, col: int, url: str, label: str) -> None:
+        c = ws.cell(row=row, column=col, value=label)
+        c.hyperlink = url
+        c.font = Font(color="0563C1", underline="single", size=10)
+        c.alignment = LEFT
 
-    # ---- Sheet 1: Repositories ----------------------------------------
-    ws_repos = wb.active
-    ws_repos.title = "Repositories"
-    _header_row(ws_repos, [
-        "Source (GitLab)", "Target (GitHub)", "Status", "Default Branch",
-        "Duration (min)", "Branches Pushed", "Source HEAD SHA", "Error", "Completed At",
-    ])
-    for ri, r in enumerate(results, 2):
-        rf = STATUS_FILLS.get(r.status, _fill("FFFFFF"))
-        for ci, val in enumerate([
-            r.source,
-            r.target,
-            r.status,
-            r.default_branch,
-            round(r.duration_seconds / 60, 3) if r.duration_seconds else "",
-            r.branch_count or "",
-            r.head_commit_sha,
-            r.error,
-            r.completed_at,
-        ], 1):
-            c = ws_repos.cell(row=ri, column=ci, value=val)
-            c.fill = rf
-            c.alignment = LEFT
-    _col_widths(ws_repos, [45, 40, 12, 18, 14, 16, 44, 50, 22])
+    def _match_icon(src_val: object, gh_val: object) -> str:
+        if not src_val or not gh_val:
+            return ""
+        return "\u2713" if src_val == gh_val else "\u2717"
 
-    # ---- Sheet 2: Run Summary -----------------------------------------
-    ws_sum = wb.create_sheet("Run Summary")
-    ws_sum.column_dimensions["A"].width = 24
-    ws_sum.column_dimensions["B"].width = 42
+    def _recommended_action(r: _RepoResult) -> str:
+        if r.status == "failed":
+            err = r.error.lower()
+            if "not found" in err or "404" in err:
+                return "Verify source repo exists on GitLab and namespace is correct"
+            if "permission" in err or "403" in err or "401" in err:
+                return "Check GitLab PAT has 'read_repository' scope; GitHub PAT needs 'repo' scope"
+            if "timed out" in err:
+                return "Repo may be large -- increase clone_timeout_seconds / push_timeout_seconds"
+            if "create github" in err or "github repo" in err:
+                return "Check GitHub PAT has 'repo' scope and target org exists"
+            return "Re-run script to retry -- check log file for detailed error"
+        if r.validation_status == "mismatch":
+            return f"Investigate mismatch: {r.validation_notes}"
+        return ""
+
+    succeeded  = [r for r in results if r.status == "succeeded"]
+    failed     = [r for r in results if r.status == "failed"]
+    skipped    = [r for r in results if r.status == "skipped"]
+    dry_run_rs = [r for r in results if r.status == "dry-run"]
+    mismatches = [r for r in results if r.validation_status == "mismatch"]
+    validated  = [r for r in results if r.status not in ("skipped", "dry-run")]
+    val_passed = sum(1 for r in validated if r.validation_status == "match")
+    val_total  = len(validated)
+    target_orgs = sorted({r.target.split("/")[0] for r in results if "/" in r.target})
+
+    import socket
+    hostname = socket.gethostname()
 
     m = report.get("timing_metrics", {})
-    summary_rows: list = [
-        ("Run Timestamp",      report["run_timestamp"]),
-        ("Auth Mode",          config.auth.mode_label),
-        ("GitLab URL",         config.gitlab_url),
-        ("GitHub URL",         config.github_url),
-        ("Concurrent Workers", str(config.max_workers)),
-        ("Dry Run",            str(config.dry_run)),
-        ("", ""),
-        ("RESULTS", ""),
-        ("Total in CSV",       str(len(config.repos))),
-        ("Succeeded",          str(sum(1 for r in results if r.status == "succeeded"))),
-        ("Failed",             str(sum(1 for r in results if r.status == "failed"))),
-        ("Skipped (done)",     str(sum(1 for r in results if r.status == "skipped"))),
-        ("Dry-Run Simulated",  str(sum(1 for r in results if r.status == "dry-run"))),
-        ("", ""),
-        ("TIMING", ""),
-        ("Total Duration",     f"{int(elapsed_seconds // 60)}m {int(elapsed_seconds % 60):02d}s"),
-    ]
-    if m:
-        summary_rows += [
-            ("Min Duration",   f"{m.get('min_seconds', 0)}s"),
-            ("Max Duration",   f"{m.get('max_seconds', 0)}s"),
-            ("Mean Duration",  f"{m.get('mean_seconds', 0)}s"),
-            ("P50 Duration",   f"{m.get('p50_seconds', 0)}s"),
-            ("P95 Duration",   f"{m.get('p95_seconds', 0)}s"),
-            ("P99 Duration",   f"{m.get('p99_seconds', 0)}s"),
-        ]
+    wb = openpyxl.Workbook()
 
-    section_font = Font(bold=True, color="1F4E79", size=10)
-    label_font   = Font(bold=True, size=10)
-    section_fill = _fill("DDEEFF")
-    for ri, (label, value) in enumerate(summary_rows, 1):
+    # =========================================================================
+    # Sheet 1: Migration Summary (management view)
+    # =========================================================================
+    ws_sum = wb.active
+    ws_sum.title = "Migration Summary"
+    ws_sum.column_dimensions["A"].width = 28
+    ws_sum.column_dimensions["B"].width = 48
+
+    def _sum_row(label: str, value: str, is_section: bool = False) -> None:
+        ri = ws_sum.max_row + 1
         cl = ws_sum.cell(row=ri, column=1, value=label)
         cv = ws_sum.cell(row=ri, column=2, value=value)
         cl.alignment = LEFT
         cv.alignment = LEFT
-        if label in ("RESULTS", "TIMING"):
-            cl.font = section_font
-            cl.fill = section_fill
-            cv.fill = section_fill
+        if is_section:
+            cl.font = Font(bold=True, color="1F4E79", size=10)
+            cl.fill = _fill("DDEEFF")
+            cv.fill = _fill("DDEEFF")
         elif label:
-            cl.font = label_font
+            cl.font = Font(bold=True, size=10)
 
-    # ---- Sheet 3: Validation ------------------------------------------
-    ws_val = wb.create_sheet("Validation")
+    _sum_row("RUN INFORMATION", "", is_section=True)
+    _sum_row("Run Date / Time",        report["run_timestamp"])
+    _sum_row("Executed On",            hostname)
+    _sum_row("Auth Mode",              config.auth.mode_label)
+    _sum_row("Source (GitLab)",        config.gitlab_url)
+    _sum_row("Target (GitHub)",        config.github_url)
+    _sum_row("Target Org(s)",          ", ".join(target_orgs) if target_orgs else "\u2014")
+    _sum_row("Dry Run",                "Yes" if config.dry_run else "No")
+    _sum_row("Rename to main",         "Yes" if config.rename_default_branch else "No")
+    _sum_row("", "")
+    _sum_row("MIGRATION RESULTS", "", is_section=True)
+    _sum_row("Total Repos in CSV",         str(len(config.repos)))
+    _sum_row("Succeeded",                  str(len(succeeded)))
+    _sum_row("Failed",                     str(len(failed)))
+    _processed = len(succeeded) + len(failed)
+    _srate = f"{len(succeeded)}/{_processed} ({len(succeeded)/_processed*100:.1f}%)" if _processed else "N/A"
+    _sum_row("Success Rate",               _srate)
+    _sum_row("Skipped (already migrated)", str(len(skipped)))
+    _sum_row("Dry-Run Simulated",          str(len(dry_run_rs)))
+    _sum_row("", "")
+    _sum_row("VALIDATION SUMMARY", "", is_section=True)
+    pass_rate = (
+        f"{val_passed}/{val_total} ({val_passed/val_total*100:.1f}%)" if val_total else "N/A"
+    )
+    _sum_row("Validation Pass Rate",   pass_rate)
+    _sum_row("Mismatches",             str(len(mismatches)))
+    _sum_row("", "")
+    _sum_row("TIMING", "", is_section=True)
+    _sum_row("Total Duration", _fmt_duration(elapsed_seconds))
+    if m:
+        _sum_row("Min / Max per Repo",
+                 f"{m.get('min_seconds', 0)}s  /  {m.get('max_seconds', 0)}s")
+        _sum_row("Mean per Repo", f"{m.get('mean_seconds', 0)}s")
+    if failed:
+        _sum_row("", "")
+        _sum_row("FAILED REPOSITORIES", "", is_section=True)
+        for r in failed:
+            _sum_row(r.source, r.error[:120] if r.error else "\u2014")
+
+    # =========================================================================
+    # Sheet 2: Repositories (team leads -- full list with GitHub URLs)
+    # =========================================================================
+    ws_repos = wb.create_sheet("Repositories")
+    _header_row(ws_repos, [
+        "Source (GitLab)", "Target (GitHub)", "GitHub URL",
+        "Status", "Visibility", "Default Branch", "Renamed to main",
+        "Branches Pushed", "Tags Pushed", "Duration (min)", "Completed At", "Error",
+    ])
+    for ri, r in enumerate(results, 2):
+        rf = STATUS_FILLS.get(r.status, _fill("FFFFFF"))
+        vals = [
+            r.source, r.target, None,
+            r.status,
+            r.visibility or "\u2014",
+            r.default_branch or "\u2014",
+            "Yes" if r.default_branch_renamed else ("No" if r.status == "succeeded" else ""),
+            r.branch_count or "",
+            r.tag_count or "",
+            round(r.duration_seconds / 60, 2) if r.duration_seconds else "",
+            r.completed_at,
+            r.error,
+        ]
+        for ci, val in enumerate(vals, 1):
+            if ci == 3:
+                if r.gh_repo_url:
+                    _hyperlink_cell(ws_repos, ri, ci, r.gh_repo_url, r.gh_repo_url)
+                    ws_repos.cell(ri, ci).fill = rf
+                continue
+            c = ws_repos.cell(row=ri, column=ci, value=val)
+            c.fill = rf
+            c.alignment = WRAP if ci == 12 else LEFT
+    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 16, 12, 14, 22, 45])
+
+    # =========================================================================
+    # Sheet 3: Failed & Mismatches (engineers -- actionable only)
+    # =========================================================================
+    ws_fail = wb.create_sheet("Failed & Mismatches")
+    _header_row(ws_fail, [
+        "Source (GitLab)", "Target (GitHub)", "GitHub URL",
+        "Issue Type", "Error / Mismatch Detail", "Recommended Action",
+    ])
+    action_rows = [r for r in results if r.status == "failed" or r.validation_status == "mismatch"]
+    for ri, r in enumerate(action_rows, 2):
+        issue_type = "Failed" if r.status == "failed" else "Validation Mismatch"
+        detail = r.error if r.status == "failed" else r.validation_notes
+        rf = STATUS_FILLS.get(r.status, VAL_FILLS.get(r.validation_status, _fill("FFFFFF")))
+        vals = [r.source, r.target, None, issue_type, detail, _recommended_action(r)]
+        for ci, val in enumerate(vals, 1):
+            if ci == 3:
+                if r.gh_repo_url:
+                    _hyperlink_cell(ws_fail, ri, ci, r.gh_repo_url, r.gh_repo_url)
+                    ws_fail.cell(ri, ci).fill = rf
+                continue
+            c = ws_fail.cell(row=ri, column=ci, value=val)
+            c.fill = rf
+            c.alignment = WRAP if ci in (5, 6) else LEFT
+    _col_widths(ws_fail, [42, 38, 52, 20, 55, 55])
+    if not action_rows:
+        ws_fail.cell(row=2, column=1,
+            value="\u2705  No failures or mismatches. All repositories migrated successfully.")
+
+    # =========================================================================
+    # Sheet 4: Validation Detail (DevOps / audit sign-off)
+    # =========================================================================
+    ws_val = wb.create_sheet("Validation Detail")
     _header_row(ws_val, [
-        "Source (GitLab)", "Target (GitHub)", "Migration Status",
-        "Source Branches", "GitHub Branches", "Branches Match",
-        "Source HEAD SHA", "GitHub HEAD SHA", "HEAD Commit Match",
+        "Source (GitLab)", "Target (GitHub)", "GitHub URL", "Migration Status",
+        "Src Branches", "GH Branches", "Branches \u2713/\u2717",
+        "Src Tags", "GH Tags", "Tags \u2713/\u2717",
+        "Src HEAD (10)", "GH HEAD (10)", "HEAD \u2713/\u2717",
+        "Default Branch", "Renamed to main",
         "Validation Status", "Validation Notes",
     ])
     for ri, r in enumerate(
         (r for r in results if r.status not in ("skipped", "dry-run")), 2
     ):
-        b_ok = bool(r.branch_count and r.gh_branch_count)
-        h_ok = bool(r.head_commit_sha and r.gh_head_commit_sha)
-        rf   = VAL_FILLS.get(r.validation_status, _fill("FFFFFF"))
-        for ci, val in enumerate([
-            r.source,
-            r.target,
+        rf = VAL_FILLS.get(r.validation_status, _fill("FFFFFF"))
+        vals = [
+            r.source, r.target, None,
             r.status,
             r.branch_count or "",
             r.gh_branch_count or "",
-            "\u2713" if b_ok and r.branch_count == r.gh_branch_count else ("\u2717" if b_ok else ""),
-            r.head_commit_sha,
-            r.gh_head_commit_sha,
-            "\u2713" if h_ok and r.head_commit_sha == r.gh_head_commit_sha else ("\u2717" if h_ok else ""),
+            _match_icon(r.branch_count, r.gh_branch_count),
+            r.tag_count or "",
+            r.gh_tag_count or "",
+            _match_icon(r.tag_count, r.gh_tag_count),
+            r.head_commit_sha[:10] if r.head_commit_sha else "",
+            r.gh_head_commit_sha[:10] if r.gh_head_commit_sha else "",
+            _match_icon(r.head_commit_sha, r.gh_head_commit_sha),
+            r.default_branch or "\u2014",
+            "Yes" if r.default_branch_renamed else "No",
             r.validation_status,
             r.validation_notes,
-        ], 1):
+        ]
+        for ci, val in enumerate(vals, 1):
+            if ci == 3:
+                if r.gh_repo_url:
+                    _hyperlink_cell(ws_val, ri, ci, r.gh_repo_url, r.gh_repo_url)
+                    ws_val.cell(ri, ci).fill = rf
+                continue
             c = ws_val.cell(row=ri, column=ci, value=val)
             c.fill = rf
-            c.alignment = LEFT
-    _col_widths(ws_val, [45, 40, 18, 16, 16, 16, 44, 44, 18, 14, 50])
+            c.alignment = WRAP if ci == 17 else LEFT
+    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 18, 16, 18, 50])
+
+    # =========================================================================
+    # Sheet 5: Run Metrics (internal ops -- not for client)
+    # =========================================================================
+    ws_met = wb.create_sheet("Run Metrics")
+    ws_met.column_dimensions["A"].width = 28
+    ws_met.column_dimensions["B"].width = 42
+
+    def _met_row(label: str, value: str, is_section: bool = False) -> None:
+        ri = ws_met.max_row + 1
+        cl = ws_met.cell(row=ri, column=1, value=label)
+        cv = ws_met.cell(row=ri, column=2, value=value)
+        cl.alignment = LEFT
+        cv.alignment = LEFT
+        if is_section:
+            cl.font = Font(bold=True, color="1F4E79", size=10)
+            cl.fill = _fill("DDEEFF")
+            cv.fill = _fill("DDEEFF")
+        elif label:
+            cl.font = Font(bold=True, size=10)
+
+    _met_row("CONFIGURATION", "", is_section=True)
+    _met_row("Auth Mode",          config.auth.mode_label)
+    _met_row("Concurrent Workers", str(config.max_workers))
+    _met_row("Clone Timeout",      f"{config.clone_timeout}s")
+    _met_row("Push Timeout",       f"{config.push_timeout}s")
+    _met_row("Git Retries",        str(config.git_max_retries))
+    _met_row("Min Free Disk",      f"{config.min_free_disk_gb} GB")
+    _met_row("Dry Run",            str(config.dry_run))
+    _met_row("Rename to main",     str(config.rename_default_branch))
+    _met_row("", "")
+    _met_row("TIMING", "", is_section=True)
+    _met_row("Total Duration", _fmt_duration(elapsed_seconds))
+    if m:
+        _met_row("Min per Repo",   f"{m.get('min_seconds', 0)}s")
+        _met_row("Max per Repo",   f"{m.get('max_seconds', 0)}s")
+        _met_row("Mean per Repo",  f"{m.get('mean_seconds', 0)}s")
 
     wb.save(str(_RESULTS_XLSX))
 
@@ -1582,10 +1814,15 @@ def _migrate_one(
         error=mr.error,
         duration_seconds=time.monotonic() - t_start,
         completed_at=_fmt_ts(),
+        visibility=spec.visibility,
+        gh_repo_url=mr.gh_repo_url,
         branch_count=mr.branch_count,
         head_commit_sha=mr.head_commit_sha,
         gh_branch_count=mr.gh_branch_count,
         gh_head_commit_sha=mr.gh_head_commit_sha,
+        tag_count=mr.tag_count,
+        gh_tag_count=mr.gh_tag_count,
+        default_branch_renamed=mr.default_branch_renamed,
         validation_status=mr.validation_status,
         validation_notes=mr.validation_notes,
     )
@@ -1663,10 +1900,7 @@ def _print_migration_preview(
     HDR_VIS = "\U0001f512 Visibility"
     HDR_BR  = "\U0001f33f Effective Branch Filter"
 
-    # Show the branch column whenever ANY filter is active — either a global
-    # default or a per-repo override.  Repos with no per-row values have already
-    # had the global patterns merged in during CSV loading, so checking each
-    # spec's lists is sufficient.
+
     any_branch_filter = (
         bool(config.branch_include or config.branch_exclude)
         or any(s.branch_include or s.branch_exclude for s in pending)
@@ -1689,9 +1923,7 @@ def _print_migration_preview(
         ]
         return f"{src} " + "  ".join(parts)
 
-    # Compute column widths.
-    # Source paths can be deep (group/subgroup/nested/project) -- use a generous
-    # cap so full paths are visible without hard truncation on normal terminals.
+
     src_w = min(max(len(HDR_SRC), max(len(f"{s.namespace}/{s.project}") for s in show)), 72)
     tgt_w = min(max(len(HDR_TGT), max(len(f"{s.target_org}/{s.target_name}") for s in show)), 56)
     vis_w = max(len(HDR_VIS), max(len(s.visibility) + 3 for s in show))  # +3 for vis icon
@@ -1881,13 +2113,17 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
     skipped   = [r for r in results if r.status == "skipped"]
     elapsed   = time.monotonic() - wall_start
 
+    processed = len(succeeded) + len(failed)
+    success_rate = f"{len(succeeded)}/{processed} ({len(succeeded)/processed*100:.1f}%)" if processed else "N/A"
+
     log.info("\u2550" * 60)
     log.info("\U0001f3c1  Migration Run Complete")
     log.info("\u2500" * 60)
     log.info(f"  \u2705  Succeeded  :  {len(succeeded)}")
     log.info(f"  \u274c  Failed     :  {len(failed)}")
     log.info(f"  \u23ed\ufe0f  Skipped    :  {len(skipped)}  (already done)")
-    log.info(f"  \u23f1\ufe0f  Elapsed    :  {int(elapsed // 60)}m {int(elapsed % 60):02d}s")
+    log.info(f"  \U0001f4ca  Success Rate:  {success_rate}")
+    log.info(f"  \u23f1\ufe0f  Elapsed    :  {_fmt_duration(elapsed)}")
     log.info("\u2550" * 60)
     if failed:
         log.warning(f"  \u26a0\ufe0f  Failed repos: {', '.join(r.target for r in failed)}")
