@@ -1,0 +1,31 @@
+{
+  "auth": {
+    "mode": "app",
+    "pat": "xxxxxxxxxx",
+    "app": {
+      "app_id": <APP_ID>,
+      "private_key_path": "./gh-app-key.pem",
+      "installation_id": <INSTALLATION_ID>
+    }
+  },
+  "github": {
+    "default_org": ""
+  },
+  "gitlab": {
+    "url": "https://gitlab.com",
+    "pat": "xxxxxxxxxx"
+  },
+  "branches": {
+    "_comment": "Global default fallback. Per-repo branch_include/branch_exclude columns in repos.csv take precedence. Patterns are Python re.search() regex; semicolon-separated in the CSV.",
+    "include": [""],
+    "exclude": [""]
+  },
+  "migration": {
+    "max_workers": 5,
+    "clone_timeout_seconds": 7200,
+    "push_timeout_seconds": 7200,
+    "git_retry_count": 3,
+    "dry_run": false,
+    "min_free_disk_gb": 10
+  }
+}
