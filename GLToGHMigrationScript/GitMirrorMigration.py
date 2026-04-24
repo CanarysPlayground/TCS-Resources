@@ -14,6 +14,7 @@ import random
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -350,6 +351,28 @@ class GitHubAppAuth(_Auth):
     def get_token_for_git(self) -> str:
         # GitHub App tokens use "x-access-token" as the username for HTTPS auth.
         return f"x-access-token:{self._ensure_valid_token()}"
+
+    def get_app_name(self) -> str:
+        """Return the GitHub App name via a JWT-authenticated GET /app request.
+
+        GET /app requires a JWT (not an installation token), so the shared
+        GitHubClient cannot be used here -- it always sends the installation token.
+        """
+        try:
+            jwt_token = self._generate_jwt()
+            req = urllib.request.Request(
+                f"{self._api_base}/app",
+                headers={
+                    "Authorization": f"Bearer {jwt_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            return data.get("name") or data.get("slug", "")
+        except Exception:
+            return ""
 
     @property
     def mode_label(self) -> str:
@@ -710,24 +733,14 @@ def _get_default_branch(mirror_dir: Path) -> str:
     return out[len(prefix):] if out.startswith(prefix) else out
 
 
-def _count_branches(mirror_dir: Path) -> int:
-    """Count refs/heads/ entries remaining in a bare clone after filtering."""
+def _count_git_refs(mirror_dir: Path, prefix: str) -> int:
+    """Count git refs under the given prefix (e.g. 'refs/heads/', 'refs/tags/')."""
     code, out, _ = _run_git(
-        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        ["git", "for-each-ref", "--format=%(refname:short)", prefix],
         cwd=mirror_dir,
         timeout=30,
     )
-    return len([b for b in out.splitlines() if b.strip()]) if code == 0 else 0
-
-
-def _count_tags(mirror_dir: Path) -> int:
-    """Count refs/tags/ entries in a bare clone."""
-    code, out, _ = _run_git(
-        ["git", "for-each-ref", "--format=%(refname:short)", "refs/tags/"],
-        cwd=mirror_dir,
-        timeout=30,
-    )
-    return len([t for t in out.splitlines() if t.strip()]) if code == 0 else 0
+    return sum(1 for r in out.splitlines() if r.strip()) if code == 0 else 0
 
 
 def _get_head_commit_sha(mirror_dir: Path, branch: str) -> str:
@@ -763,29 +776,26 @@ def _set_github_default_branch(
         )
 
 
-def _get_github_branch_count(client: GitHubClient, org: str, repo: str) -> int:
-    """Return the total number of branches in a GitHub repo (handles pagination)."""
-    page, total = 1, 0
-    while True:
-        st, resp = client.request(
-            "GET", f"/repos/{org}/{repo}/branches?per_page=100&page={page}"
-        )
-        if st != 200 or not isinstance(resp, list):
-            break
-        total += len(resp)
-        if len(resp) < 100:
-            break
-        page += 1
-    return total
+def _get_github_actor(client: GitHubClient, auth: _Auth) -> str:
+    """Return the login/name of the token owner.
+
+    For PAT auth  → GET /user  (installation token) → login
+    For App auth  → GET /app   (JWT required)         → app name / slug
+    Returns an empty string on any failure so it never blocks the migration.
+    """
+    if isinstance(auth, GitHubAppAuth):
+        return auth.get_app_name()
+    st, resp = client.request("GET", "/user")
+    if st == 200 and isinstance(resp, dict):
+        return resp.get("login", "")
+    return ""
 
 
-def _get_github_tag_count(client: GitHubClient, org: str, repo: str) -> int:
-    """Return the total number of tags in a GitHub repo (handles pagination)."""
+def _get_github_list_count(client: GitHubClient, path: str) -> int:
+    """Return the paginated item count at the given GitHub REST list endpoint."""
     page, total = 1, 0
     while True:
-        st, resp = client.request(
-            "GET", f"/repos/{org}/{repo}/tags?per_page=100&page={page}"
-        )
+        st, resp = client.request("GET", f"{path}?per_page=100&page={page}")
         if st != 200 or not isinstance(resp, list):
             break
         total += len(resp)
@@ -872,7 +882,6 @@ def _filter_branches(
     exclude_patterns: list[str],
     label: str,
 ) -> None:
- 
     if not include_patterns and not exclude_patterns:
         return
     code, out, _ = _run_git(
@@ -968,8 +977,8 @@ def _mirror_repo(
 
         _filter_branches(mirror_dir, spec.branch_include, spec.branch_exclude, name)
 
-        branch_count   = _count_branches(mirror_dir)
-        tag_count      = _count_tags(mirror_dir)
+        branch_count = _count_git_refs(mirror_dir, "refs/heads/")
+        tag_count    = _count_git_refs(mirror_dir, "refs/tags/")
         default_branch = _get_default_branch(mirror_dir)
         head_sha       = _get_head_commit_sha(mirror_dir, default_branch)
         if default_branch:
@@ -1013,8 +1022,8 @@ def _mirror_repo(
             _set_github_default_branch(client, spec.target_org, name, default_branch)
 
         gh_repo_url = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
-        gh_branches = _get_github_branch_count(client, spec.target_org, name)
-        gh_tags     = _get_github_tag_count(client, spec.target_org, name)
+        gh_branches = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/branches")
+        gh_tags     = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/tags")
         gh_head_sha = _get_github_head_commit_sha(client, spec.target_org, name, default_branch)
         v_status, v_notes = _compute_validation(
             branch_count, head_sha, gh_branches, gh_head_sha, tag_count, gh_tags
@@ -1402,6 +1411,7 @@ def _write_reports(
     run_started: str,
     config: MigrationConfig,
     elapsed_seconds: float = 0.0,
+    executed_by: str = "",
 ) -> None:
     """Write timestamped JSON and XLSX (or CSV fallback) reports to the reports folder."""
     succeeded = [r for r in results if r.status == "succeeded"]
@@ -1414,6 +1424,7 @@ def _write_reports(
     # ---- JSON ----------------------------------------------------------
     report: dict = {
         "run_timestamp": run_started,
+        "executed_by": executed_by,
         "auth_mode": config.auth.mode_label,
         "dry_run": config.dry_run,
         "target_orgs": target_orgs,
@@ -1462,7 +1473,7 @@ def _write_reports(
 
     # ---- XLSX / CSV ----------------------------------------------------
     if _XLSX_AVAILABLE:
-        _write_xlsx(results, report, config, elapsed_seconds)
+        _write_xlsx(results, report, config, elapsed_seconds, executed_by)
         log.info(f"XLSX report : {_RESULTS_XLSX}")
     else:
         _write_csv_fallback(results)
@@ -1480,15 +1491,20 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
     with _RESULTS_CSV.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow([
-            "source", "target", "status", "default_branch",
-            "duration_min", "branch_count", "head_commit_sha",
-            "error", "completed_at",
+            "source", "target", "gh_repo_url", "status", "visibility",
+            "default_branch", "default_branch_renamed", "duration_min",
+            "branch_count", "head_commit_sha", "tag_count",
+            "gh_branch_count", "gh_head_commit_sha", "gh_tag_count",
+            "validation_status", "validation_notes", "error", "completed_at",
         ])
         for r in results:
             writer.writerow([
-                r.source, r.target, r.status, r.default_branch,
+                r.source, r.target, r.gh_repo_url, r.status, r.visibility,
+                r.default_branch, r.default_branch_renamed,
                 round(r.duration_seconds / 60, 3) if r.duration_seconds else "",
-                r.branch_count or "", r.head_commit_sha, r.error, r.completed_at,
+                r.branch_count or "", r.head_commit_sha, r.tag_count or "",
+                r.gh_branch_count or "", r.gh_head_commit_sha, r.gh_tag_count or "",
+                r.validation_status, r.validation_notes, r.error, r.completed_at,
             ])
 
 
@@ -1497,6 +1513,7 @@ def _write_xlsx(
     report: dict,
     config: MigrationConfig,
     elapsed_seconds: float,
+    executed_by: str = "",
 ) -> None:
     """Write a multi-sheet XLSX report: Repositories, Run Summary, Validation."""
     import openpyxl
@@ -1573,9 +1590,7 @@ def _write_xlsx(
     val_total  = len(validated)
     target_orgs = sorted({r.target.split("/")[0] for r in results if "/" in r.target})
 
-    import socket
     hostname = socket.gethostname()
-
     m = report.get("timing_metrics", {})
     wb = openpyxl.Workbook()
 
@@ -1602,6 +1617,7 @@ def _write_xlsx(
 
     _sum_row("RUN INFORMATION", "", is_section=True)
     _sum_row("Run Date / Time",        report["run_timestamp"])
+    _sum_row("Executed By",            executed_by or "\u2014")
     _sum_row("Executed On",            hostname)
     _sum_row("Auth Mode",              config.auth.mode_label)
     _sum_row("Source (GitLab)",        config.gitlab_url)
@@ -1900,7 +1916,6 @@ def _print_migration_preview(
     HDR_VIS = "\U0001f512 Visibility"
     HDR_BR  = "\U0001f33f Effective Branch Filter"
 
-
     any_branch_filter = (
         bool(config.branch_include or config.branch_exclude)
         or any(s.branch_include or s.branch_exclude for s in pending)
@@ -2019,6 +2034,9 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
         max_retries=_DEFAULT_API_RETRIES,
     )
     _preflight_checks(config, client)
+    gh_actor = _get_github_actor(client, config.auth)
+    if gh_actor:
+        log.info(f"Authenticated as: {gh_actor}")
     state = MigrationState(_CHECKPOINT_FILE)
 
     # Split repos into already-done (skip) and pending (process).
@@ -2048,7 +2066,7 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
     total = len(pending)
     if total == 0:
         log.info("All repositories have already been migrated. Nothing to do.")
-        _write_reports(skipped_results, _fmt_ts(), config, elapsed_seconds=0.0)
+        _write_reports(skipped_results, _fmt_ts(), config, elapsed_seconds=0.0, executed_by=gh_actor)
         return
 
     run_started = _fmt_ts()
@@ -2129,7 +2147,7 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
         log.warning(f"  \u26a0\ufe0f  Failed repos: {', '.join(r.target for r in failed)}")
         log.info("  \U0001f504  Re-run the script to retry failed repositories automatically.")
 
-    _write_reports(results, run_started, config, elapsed_seconds=elapsed)
+    _write_reports(results, run_started, config, elapsed_seconds=elapsed, executed_by=gh_actor)
 
 
 # ===========================================================================
@@ -2153,3 +2171,4 @@ if __name__ == "__main__":
     except Exception as exc:
         log.error(f"Unexpected error: {exc}")
         sys.exit(1)
+        
