@@ -556,6 +556,8 @@ class _RepoResult:
     gh_head_commit_sha: str = ""      # HEAD commit SHA on GitHub after push
     tag_count: int = 0                # tag count from source bare clone
     gh_tag_count: int = 0             # tag count on GitHub after push
+    commit_count: int = 0             # commit count on default branch (source bare clone)
+    gh_commit_count: int = 0          # commit count on default branch on GitHub after push
     default_branch_renamed: bool = False  # True if source default branch was renamed to 'main'
     validation_status: str = ""       # "match" | "mismatch" | "unknown" | "dry-run"
     validation_notes: str = ""        # human-readable diff notes
@@ -573,6 +575,8 @@ class _MirrorResult:
     gh_head_commit_sha: str = ""
     tag_count: int = 0
     gh_tag_count: int = 0
+    commit_count: int = 0
+    gh_commit_count: int = 0
     gh_repo_url: str = ""
     default_branch_renamed: bool = False
     validation_status: str = ""
@@ -743,6 +747,19 @@ def _count_git_refs(mirror_dir: Path, prefix: str) -> int:
     return sum(1 for r in out.splitlines() if r.strip()) if code == 0 else 0
 
 
+def _count_git_commits(mirror_dir: Path) -> int:
+    """Return the total commit count reachable from HEAD in a bare clone."""
+    code, out, _ = _run_git(
+        ["git", "rev-list", "--count", "HEAD"],
+        cwd=mirror_dir,
+        timeout=60,
+    )
+    try:
+        return int(out.strip()) if code == 0 else 0
+    except ValueError:
+        return 0
+
+
 def _get_head_commit_sha(mirror_dir: Path, branch: str) -> str:
     """Return the full commit SHA at refs/heads/<branch> in a bare clone."""
     if not branch:
@@ -824,6 +841,8 @@ def _compute_validation(
     gh_head_sha: str,
     tag_count: int = 0,
     gh_tag_count: int = 0,
+    commit_count: int = 0,
+    gh_commit_count: int = 0,
 ) -> tuple[str, str]:
     """Compare source bare-clone data against GitHub post-push data.
 
@@ -841,6 +860,8 @@ def _compute_validation(
         notes.append(f"HEAD SHA: source={head_sha[:8]}... github={gh_head_sha[:8]}...")
     if tag_count and gh_tag_count and tag_count != gh_tag_count:
         notes.append(f"tag count: source={tag_count} github={gh_tag_count}")
+    if commit_count and gh_commit_count and commit_count != gh_commit_count:
+        notes.append(f"commit count: source={commit_count} github={gh_commit_count}")
     return ("mismatch", "; ".join(notes)) if notes else ("match", "")
 
 
@@ -979,10 +1000,14 @@ def _mirror_repo(
 
         branch_count = _count_git_refs(mirror_dir, "refs/heads/")
         tag_count    = _count_git_refs(mirror_dir, "refs/tags/")
+        commit_count = _count_git_commits(mirror_dir)
         default_branch = _get_default_branch(mirror_dir)
         head_sha       = _get_head_commit_sha(mirror_dir, default_branch)
         if default_branch:
-            log.info(f"[{name}] Default branch: '{default_branch}' | {branch_count} branch(es) | {tag_count} tag(s)")
+            log.info(
+                f"[{name}] Default branch: '{default_branch}' | "
+                f"{branch_count} branch(es) | {tag_count} tag(s) | {commit_count} commit(s)"
+            )
         else:
             log.warning(f"[{name}] Could not determine source default branch")
 
@@ -1021,12 +1046,14 @@ def _mirror_repo(
         if default_branch:
             _set_github_default_branch(client, spec.target_org, name, default_branch)
 
-        gh_repo_url = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
-        gh_branches = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/branches")
-        gh_tags     = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/tags")
-        gh_head_sha = _get_github_head_commit_sha(client, spec.target_org, name, default_branch)
+        gh_repo_url  = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
+        gh_branches  = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/branches")
+        gh_tags      = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/tags")
+        gh_commits   = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/commits")
+        gh_head_sha  = _get_github_head_commit_sha(client, spec.target_org, name, default_branch)
         v_status, v_notes = _compute_validation(
-            branch_count, head_sha, gh_branches, gh_head_sha, tag_count, gh_tags
+            branch_count, head_sha, gh_branches, gh_head_sha,
+            tag_count, gh_tags, commit_count, gh_commits,
         )
 
         return _MirrorResult(
@@ -1038,6 +1065,8 @@ def _mirror_repo(
             gh_head_commit_sha=gh_head_sha,
             tag_count=tag_count,
             gh_tag_count=gh_tags,
+            commit_count=commit_count,
+            gh_commit_count=gh_commits,
             gh_repo_url=gh_repo_url,
             default_branch_renamed=renamed,
             validation_status=v_status,
@@ -1725,6 +1754,7 @@ def _write_xlsx(
         "Source (GitLab)", "Target (GitHub)", "GitHub URL", "Migration Status",
         "Src Branches", "GH Branches", "Branches \u2713/\u2717",
         "Src Tags", "GH Tags", "Tags \u2713/\u2717",
+        "Src Commits", "GH Commits", "Commits \u2713/\u2717",
         "Src HEAD (10)", "GH HEAD (10)", "HEAD \u2713/\u2717",
         "Default Branch", "Renamed to main",
         "Validation Status", "Validation Notes",
@@ -1742,6 +1772,9 @@ def _write_xlsx(
             r.tag_count or "",
             r.gh_tag_count or "",
             _match_icon(r.tag_count, r.gh_tag_count),
+            r.commit_count or "",
+            r.gh_commit_count or "",
+            _match_icon(r.commit_count, r.gh_commit_count),
             r.head_commit_sha[:10] if r.head_commit_sha else "",
             r.gh_head_commit_sha[:10] if r.gh_head_commit_sha else "",
             _match_icon(r.head_commit_sha, r.gh_head_commit_sha),
@@ -1758,8 +1791,8 @@ def _write_xlsx(
                 continue
             c = ws_val.cell(row=ri, column=ci, value=val)
             c.fill = rf
-            c.alignment = WRAP if ci == 17 else LEFT
-    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 18, 16, 18, 50])
+            c.alignment = WRAP if ci == 20 else LEFT
+    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 14, 14, 14, 18, 16, 18, 50])
 
     # =========================================================================
     # Sheet 5: Run Metrics (internal ops -- not for client)
@@ -1838,6 +1871,8 @@ def _migrate_one(
         gh_head_commit_sha=mr.gh_head_commit_sha,
         tag_count=mr.tag_count,
         gh_tag_count=mr.gh_tag_count,
+        commit_count=mr.commit_count,
+        gh_commit_count=mr.gh_commit_count,
         default_branch_renamed=mr.default_branch_renamed,
         validation_status=mr.validation_status,
         validation_notes=mr.validation_notes,
@@ -2171,4 +2206,3 @@ if __name__ == "__main__":
     except Exception as exc:
         log.error(f"Unexpected error: {exc}")
         sys.exit(1)
-        
