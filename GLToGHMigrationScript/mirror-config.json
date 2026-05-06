@@ -1,11 +1,11 @@
 {
   "auth": {
     "mode": "app",
-    "pat": "xxxxxxxxxx",
+    "pat": "",
     "app": {
-      "app_id": <APP_ID>,
-      "private_key_path": "./gh-app-key.pem",
-      "installation_id": <INSTALLATION_ID>
+      "app_id": ,
+      "private_key_path": "./.pem",
+      "installation_id": 
     }
   },
   "github": {
@@ -13,20 +13,34 @@
   },
   "gitlab": {
     "url": "https://gitlab.com",
-    "pat": "xxxxxxxxxx"
+    "pat": ""
   },
   "branches": {
     "_comment": "Global default fallback. Per-repo branch_include/branch_exclude columns in repos.csv take precedence. Patterns are Python re.search() regex; semicolon-separated in the CSV.",
-    "include": [""],
-    "exclude": [""]
+    "include": [],
+    "exclude": []
   },
   "migration": {
-    "rename_default_branch_to_main": true,
+    "rename_default_branch_to_main": false,
     "max_workers": 5,
     "clone_timeout_seconds": 7200,
     "push_timeout_seconds": 7200,
     "git_retry_count": 3,
     "dry_run": false,
-    "min_free_disk_gb": 10
+    "min_free_disk_gb": 10,
+    "git_http_post_buffer_bytes": 524288000,
+    "git_push_batch_size": 100,
+    "lfs_enabled": false,
+    "detailed_commit_count": false,
+    "check_oversized_files": true
+  },
+  "ci_skeleton": {
+    "_comment": "Creates a starter workflow file in each GitHub repo immediately after migration. Set 'enabled' to false to skip this step entirely.",
+    "enabled": true,
+    "templates_dir": "ci-templates",
+    "target_path": ".github/workflows",
+    "commit_message": "chore: add CI skeleton workflow [migration]",
+    "branches": ["main", "master", "develop"],
+    "skip_if_exists": true
   }
 }
