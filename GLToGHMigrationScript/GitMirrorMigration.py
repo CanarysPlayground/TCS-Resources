@@ -223,31 +223,140 @@ def _count_lfs_objects(mirror_dir: Path) -> int:
 # ---------------------------------------------------------------------------
 # Colored console logging
 # ---------------------------------------------------------------------------
-class _ColorFormatter(logging.Formatter):
-    """ANSI-colored formatter for interactive terminal sessions only."""
 
-    _RESET = "\x1b[0m"
-    _BOLD  = "\x1b[1m"
-    _DIM   = "\x1b[2m"
-    _LEVEL_COLORS = {
-        logging.DEBUG:    "\x1b[36m",   # Cyan
-        logging.INFO:     "\x1b[32m",   # Green
-        logging.WARNING:  "\x1b[33m",   # Yellow
-        logging.ERROR:    "\x1b[31m",   # Red
-        logging.CRITICAL: "\x1b[35m",   # Magenta
+# Module-level flag: True only when stdout is an interactive TTY with ANSI support.
+# Set by _build_logger(); checked by _c() so inline colorisation is
+# unconditionally safe to call anywhere in the module.
+_COLORS_ACTIVE: bool = False
+
+
+def _c(text: str, *codes: int) -> str:
+    """Wrap *text* in ANSI SGR escape codes when color output is active.
+
+    Falls back to plain *text* when colors are disabled (non-TTY, CI, file
+    redirect) so every call site is safe without an ``if`` guard.
+
+    ANSI code reference (common codes used in this module):
+      1=bold  2=dim  4=underline  22=normal-intensity
+      30-37=standard fg  90-97=bright fg
+      31=red  32=green  33=yellow  34=blue  35=magenta  36=cyan  37=white
+      91=bright-red  92=bright-green  93=bright-yellow  96=bright-cyan  97=bright-white
+    """
+    if not _COLORS_ACTIVE or not codes:
+        return text
+    return f"\x1b[{';'.join(map(str, codes))}m{text}\x1b[0m"
+
+
+class _ColorFormatter(logging.Formatter):
+    """ANSI-colored log formatter for interactive terminal sessions.
+
+    Three-zone coloring per record:
+      Timestamp   → always dim dark-gray (metadata, unobtrusive)
+      Level badge → bold + level color   (instant severity scan)
+      Message body → level-specific base, with automatic inline pattern
+                     recoloring on INFO lines: [labels], action verbs,
+                     number+unit combos, durations, and URLs.
+
+    Pattern recoloring is intentionally skipped when the message already
+    contains ANSI escape sequences (i.e. colored via _c() at the call site),
+    so the rich per-line colors in the summary banner are preserved as-is.
+
+    No third-party dependencies; works on Windows 10+ via ctypes ANSI enable.
+    """
+
+    # (badge_color, body_base_color)
+    # INFO body uses "\x1b[2;39m" (dim default-fg) so it renders as a
+    # comfortable medium-gray on dark terminals instead of glaring bright white.
+    _LEVEL_STYLES: dict[int, tuple[str, str]] = {
+        logging.DEBUG:    ("\x1b[36m",    "\x1b[2;90m"),   # cyan badge,         dim dark-gray body
+        logging.INFO:     ("\x1b[32m",    "\x1b[2;39m"),   # green badge,        dim default-fg body
+        logging.WARNING:  ("\x1b[1;33m",  "\x1b[33m"),     # bold-yellow badge,  yellow body
+        logging.ERROR:    ("\x1b[1;31m",  "\x1b[31m"),     # bold-red badge,     red body
+        logging.CRITICAL: ("\x1b[1;35m",  "\x1b[1;35m"),  # bold-magenta badge + body
     }
-    _FMT = (
-        "{dim}%(asctime)s{reset} "
-        "{bold}{color}[%(levelname)s]{reset} "
-        "{color}%(message)s{reset}"
+    _TS_COLOR = "\x1b[2;90m"
+    _RESET    = "\x1b[0m"
+
+    # ---------------------------------------------------------------------------
+    # Compiled patterns for INFO inline recoloring.
+    # Applied in order so earlier substitutions don't interfere with later ones.
+    # ---------------------------------------------------------------------------
+
+    # [org/repo] or [label] prefix at the very start of the message.
+    _RE_LABEL = re.compile(r'^\[([^\]]{1,80})\]')
+
+    # Key action verbs/phrases that indicate what the script is doing.
+    _RE_ACTION = re.compile(
+        r'\b('
+        r'Cloning|Pushing|Validating|Applying|Fetching|Retrying|Processing|'
+        r'Creating|Setting|Scanning|Checking|Starting|Splitting|Migrating|'
+        r'Already fully migrated|Push done|Clone done|'
+        r'Custom properties applied|CI skeleton created'
+        r')\b'
     )
 
-    def format(self, record: logging.LogRecord) -> str:
-        color = self._LEVEL_COLORS.get(record.levelno, "")
-        fmt = self._FMT.format(
-            color=color, bold=self._BOLD, dim=self._DIM, reset=self._RESET
+    # Numeric value immediately followed by a git/migration unit word.
+    _RE_NUM_UNIT = re.compile(
+        r'\b(\d[\d,]*)\s+(branch(?:es)?|tag[s]?|commit[s]?|'
+        r'repo[s]?|ref[s]?|file[s]?|worker[s]?|task[s]?|batch(?:es)?)\b',
+        re.IGNORECASE,
+    )
+
+    # Duration strings: "2m 03s" or "1.5s"  (not plain "8s" — too broad).
+    _RE_DURATION = re.compile(r'\b(\d+m\s+\d{1,2}s|\d+\.\d+s)\b')
+
+    # HTTP/HTTPS URLs — minimum 8 chars after scheme to avoid false positives.
+    _RE_URL = re.compile(r'https?://[^\s\x1b,;]{8,}')
+
+    def _recolor_info(self, msg: str, base: str) -> str:
+        """Apply inline color spans to a plain (no existing ANSI) INFO message."""
+        R = self._RESET + base   # restore base color after every colored span
+
+        # 1. [label] → bold bright-cyan  (stands out as the repo/context identifier)
+        msg = self._RE_LABEL.sub(
+            lambda m: f"\x1b[1;96m[{m.group(1)}]{R}", msg
         )
-        return logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S").format(record)
+        # 2. Action words → bold bright-white  (pop against dim-gray base)
+        msg = self._RE_ACTION.sub(
+            lambda m: f"\x1b[1;97m{m.group()}{R}", msg
+        )
+        # 3. number + unit → bright-cyan number, unit stays in base color
+        msg = self._RE_NUM_UNIT.sub(
+            lambda m: f"\x1b[96m{m.group(1)}{R} {m.group(2)}", msg
+        )
+        # 4. Durations → bright-cyan  (time values deserve attention)
+        msg = self._RE_DURATION.sub(
+            lambda m: f"\x1b[96m{m.group()}{R}", msg
+        )
+        # 5. URLs → dim cyan  (visible but not distracting)
+        msg = self._RE_URL.sub(
+            lambda m: f"\x1b[2;36m{m.group()}{R}", msg
+        )
+        return msg
+
+    def format(self, record: logging.LogRecord) -> str:
+        badge_color, body_color = self._LEVEL_STYLES.get(record.levelno, ("", ""))
+
+        msg = record.getMessage()
+        # Apply pattern recoloring only on plain INFO messages.
+        # Messages that already contain ANSI codes (from _c() at the call site)
+        # are left untouched so their existing fine-grained colors are preserved.
+        if record.levelno == logging.INFO and body_color and "\x1b[" not in msg:
+            msg = self._recolor_info(msg, body_color)
+
+        # Never mutate the shared LogRecord -- use a throwaway copy.
+        rec      = logging.makeLogRecord(record.__dict__)
+        rec.msg  = msg
+        rec.args = ()
+
+        # %-8s pads the level name so all columns align:
+        # DEBUG=5, INFO=4, WARNING=7, ERROR=5, CRITICAL=8 chars → pad to 8.
+        fmt = (
+            f"{self._TS_COLOR}%(asctime)s{self._RESET} "
+            f"{badge_color}\x1b[1m[%(levelname)-8s]{self._RESET} "
+            f"{body_color}%(message)s{self._RESET}"
+        )
+        return logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S").format(rec)
 
 
 def _enable_windows_ansi() -> None:
@@ -281,10 +390,12 @@ def _reconfigure_stdout_utf8() -> None:
 
 def _build_logger() -> logging.Logger:
     """Build a colored console + plain UTF-8 file logger."""
+    global _COLORS_ACTIVE
     _reconfigure_stdout_utf8()
     _enable_windows_ansi()
 
     use_color = sys.stdout.isatty()
+    _COLORS_ACTIVE = use_color
     console = logging.StreamHandler()
     console.setFormatter(
         _ColorFormatter()
@@ -559,7 +670,11 @@ class GitHubClient:
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     self._update_rate_limit(dict(resp.headers))
-                    return resp.status, json.loads(resp.read())
+                    raw = resp.read()
+                    # 204 No Content (and similar) return an empty body.
+                    # json.loads(b"") raises JSONDecodeError, so guard here.
+                    body_parsed: dict = json.loads(raw) if raw.strip() else {}
+                    return resp.status, body_parsed
 
             except urllib.error.HTTPError as exc:
                 resp_headers = dict(exc.headers) if exc.headers else {}
@@ -702,11 +817,19 @@ class _RepoResult:
     # LFS migration detail
     lfs_detected: bool = False          # True if LFS objects were found in the source repo
     lfs_object_count: int = 0           # number of LFS objects migrated
+    # True when GitHub HEAD is strictly ahead of the migrated (GitLab) HEAD --
+    # i.e. GitHub has extra commits such as .github CI skeleton on top.
+    # Migration is still correct; HEAD SHA difference is expected and intentional.
+    gh_head_is_ahead: bool = False
     # CI skeleton creation detail (populated after successful push when ci_skeleton is enabled)
     ci_skeleton_status: str = ""        # "created" | "partial" | "skipped_all" | "failed" | "not_configured" | "dry-run"
     ci_skeleton_branches_created: list[str] = field(default_factory=list)
     ci_skeleton_branches_skipped: list[str] = field(default_factory=list)
     ci_skeleton_error: str = ""
+    # Custom properties detail
+    custom_properties_status: str = ""   # "applied" | "failed" | "skipped" | "not_configured" | "dry-run"
+    custom_properties_applied: dict = field(default_factory=dict)   # {prop: value} as applied
+    custom_properties_error: str = ""
 
 
 @dataclass
@@ -741,6 +864,11 @@ class _MirrorResult:
     branch_sha_mismatches: list[str] = field(default_factory=list)
     lfs_detected: bool = False
     lfs_object_count: int = 0
+    # True when GitHub HEAD is strictly *ahead* of GitLab HEAD on the default
+    # branch, meaning GitHub has extra commits (e.g. .github CI skeleton) that
+    # are not on GitLab. The migration is still correct -- GitLab history is
+    # fully present on GitHub -- but the SHA comparison must not flag a mismatch.
+    gh_head_is_ahead: bool = False
 
 
 # ===========================================================================
@@ -776,6 +904,7 @@ class MigrationState:
 
     def is_succeeded(self, key: str) -> bool:
         with self._lock:
+            # "partial" is NOT considered done -- re-run will retry the failed sub-steps.
             return self._state.get(key) == "succeeded"
 
     def record(self, key: str, status: str) -> None:
@@ -1186,6 +1315,44 @@ def _get_github_head_commit_sha(
     if st == 200 and isinstance(resp, dict):
         return resp.get("object", {}).get("sha", "")
     return ""
+
+
+def _get_github_commit_count(client: GitHubClient, org: str, repo: str, sha: str) -> int:
+    """Return the commit count on *sha* via the GitHub commits API.
+
+    Strategy: GET /repos/{org}/{repo}/commits?sha={sha}&per_page=1
+    GitHub returns a ``Link`` header whose ``rel="last"`` URL contains
+    ``page=N`` — that N is the total commit count (one commit per page).
+    Falls back to 0 on any error (the caller treats 0 as 'unknown').
+
+    Note: GitHub caps this at ~10 000 for very large histories, but it is
+    accurate enough for display purposes.
+    """
+    if not sha:
+        return 0
+    url = f"{client._api_base}/repos/{org}/{repo}/commits?sha={sha}&per_page=1"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": client._auth.get_auth_header(),
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            link = resp.headers.get("Link", "")
+            # Link header format (RFC 5988):
+            # <https://api.github.com/...?page=347>; rel="last"
+            import re as _re
+            m = _re.search(r'[?&]page=(\d+)>[^,]*rel="last"', link)
+            if m:
+                return int(m.group(1))
+            # No Link header means the entire history fits on one page.
+            body = json.loads(resp.read())
+            return len(body) if isinstance(body, list) else 0
+    except Exception:
+        return 0
 
 
 def _get_github_ref_names(client: GitHubClient, path: str) -> set[str]:
@@ -1672,6 +1839,82 @@ def _find_oversized_blobs(mirror_dir: Path, label: str, timeout: int = 180) -> i
 # Core per-repo mirror operation
 # ===========================================================================
 
+def _github_is_ahead(
+    client: "GitHubClient",
+    org: str,
+    repo_name: str,
+    base_sha: str,
+    head_sha: str,
+) -> bool:
+    """Return True if *head_sha* (GitHub) is strictly ahead of *base_sha* (GitLab).
+
+    Uses GitHub's compare endpoint: GET /repos/{org}/{repo}/compare/{base}...{head}.
+    ``status == "ahead"`` means GitHub has extra commits on top of the GitLab
+    history and those GitLab commits are all present -- safe to skip re-push.
+    Any other status ("behind", "diverged") or an API error returns False so the
+    caller proceeds with the normal clone+push path (conservative fall-through).
+    """
+    if not base_sha or not head_sha or base_sha == head_sha:
+        return False
+    try:
+        status_code, data = client.request(
+            "GET", f"/repos/{org}/{repo_name}/compare/{base_sha}...{head_sha}"
+        )
+        if status_code == 200 and isinstance(data, dict):
+            return data.get("status") == "ahead"
+    except Exception:
+        pass
+    return False
+
+
+def _ls_remote_refs(
+    clone_url: str,
+    log_url: str,
+    label: str,
+    timeout: int = 120,
+) -> tuple[str, dict[str, str], set[str]]:
+    """Fetch only ref metadata from a remote via git ls-remote (no object transfer).
+
+    Returns (default_branch, {branch_name: sha}, {tag_name}).
+    All three values will be empty/falsy on failure.
+    """
+    rc, out, _ = _run_git(
+        ["git", "ls-remote", "--symref", clone_url, "HEAD", "refs/heads/*", "refs/tags/*"],
+        log_cmd=["git", "ls-remote", "--symref", log_url, "HEAD", "refs/heads/*", "refs/tags/*"],
+        timeout=timeout,
+    )
+    if rc != 0:
+        log.debug(f"[{label}] git ls-remote failed (rc={rc}) -- will fall back to full clone")
+        return "", {}, set()
+
+    default_branch = ""
+    branch_shas: dict[str, str] = {}
+    tag_names: set[str] = set()
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("ref:"):
+            # "ref: refs/heads/main\tHEAD"
+            ref_target = line[len("ref:"):].strip().split("\t", 1)[0].strip()
+            if ref_target.startswith("refs/heads/"):
+                default_branch = ref_target[len("refs/heads/"):]
+        else:
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            sha, ref = parts[0].strip(), parts[1].strip()
+            if ref.endswith("^{}"):
+                continue  # dereferenced tag object -- skip
+            if ref.startswith("refs/heads/"):
+                branch_shas[ref[len("refs/heads/"):]] = sha
+            elif ref.startswith("refs/tags/"):
+                tag_names.add(ref[len("refs/tags/"):])
+
+    return default_branch, branch_shas, tag_names
+
+
 def _mirror_repo(
     spec: RepoSpec,
     config: MigrationConfig,
@@ -1724,12 +1967,111 @@ def _mirror_repo(
                 k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
                 for k, v in _raw_props.items()
             }
-        repo_created, _ = _create_github_repo(
+        repo_created, newly_created = _create_github_repo(
             client, spec.target_org, name, spec.visibility,
             custom_properties=_creation_props,
         )
         if not repo_created:
             return _MirrorResult(ok=False, error="Failed to create GitHub repository")
+
+        # Fast-path: if the GitHub repo already existed, check whether migration is
+        # already complete using git ls-remote (metadata only -- no object transfer).
+        # This avoids a full clone+push for repos that are already fully migrated,
+        # even when the checkpoint file has been deleted.
+        if not newly_created:
+            log.info(
+                f"[{name}] GitHub repo already exists -- checking via ls-remote "
+                "whether migration is already complete..."
+            )
+            _ls_db, _ls_br_shas, _ls_tag_names = _ls_remote_refs(
+                clone_url, safe_clone, name,
+                timeout=min(config.clone_timeout, 120),
+            )
+            if _ls_br_shas or _ls_tag_names:
+                _gh_br_shas = _get_github_branch_shas(client, spec.target_org, name)
+                _gh_tag_names = _get_github_ref_names(
+                    client, f"/repos/{spec.target_org}/{name}/tags"
+                )
+                _missing_br = sorted(set(_ls_br_shas) - set(_gh_br_shas))
+                _missing_tg = sorted(_ls_tag_names - _gh_tag_names)
+                # A branch where GitHub is strictly *ahead* of GitLab means GitHub
+                # has extra commits (e.g. .github CI skeleton) that are not on GitLab.
+                # Treating those as a mismatch would trigger a force-push that wipes
+                # those extra commits.  Use the compare API to distinguish "ahead"
+                # (safe to skip) from "behind/diverged" (needs re-push).
+                _sha_mismatch = []
+                _gh_ahead_branches = []
+                for _b in _ls_br_shas:
+                    if _b not in _gh_br_shas:
+                        continue  # counted in _missing_br already
+                    if _ls_br_shas[_b] == _gh_br_shas[_b]:
+                        continue  # SHAs match -- fine
+                    if _github_is_ahead(client, spec.target_org, name, _ls_br_shas[_b], _gh_br_shas[_b]):
+                        _gh_ahead_branches.append(_b)
+                    else:
+                        _sha_mismatch.append(_b)
+                if _gh_ahead_branches:
+                    log.info(
+                        f"[{name}] GitHub is ahead of GitLab on "
+                        f"{len(_gh_ahead_branches)} branch(es) "
+                        f"({', '.join(_gh_ahead_branches[:5])}{'...' if len(_gh_ahead_branches) > 5 else ''}) "
+                        "-- likely .github CI skeleton commits; excluded from mismatch check"
+                    )
+                if not _missing_br and not _missing_tg and not _sha_mismatch:
+                    _db = _ls_db or next(iter(_ls_br_shas), "")
+                    _db_sha = _ls_br_shas.get(_db, "")
+                    # Fetch commit count from GitHub for the default branch so the
+                    # progress line can show [Nb Nt Nc] even on the fast-exit path.
+                    _commit_count = _get_github_commit_count(
+                        client, spec.target_org, name, _db_sha
+                    ) if _db_sha else 0
+                    _commit_info = f", {_commit_count:,} commit(s) on '{_db}'" if _commit_count else ""
+                    # Determine whether GitHub HEAD is ahead of GitLab HEAD
+                    # (i.e. GitHub has .github CI skeleton commits on top).
+                    # If so, record gh_head_is_ahead=True so the report can
+                    # show a qualified match instead of a false mismatch.
+                    _current_gh_sha = _gh_br_shas.get(_db, "")
+                    _gh_ahead = _db_sha != _current_gh_sha and _github_is_ahead(
+                        client, spec.target_org, name, _db_sha, _current_gh_sha
+                    )
+                    if _gh_ahead:
+                        log.info(
+                            f"[{name}] Already fully migrated: {len(_ls_br_shas)} branch(es), "
+                            f"{len(_ls_tag_names)} tag(s), all GitLab SHAs present"
+                            f"{_commit_info} -- GitHub HEAD is ahead (extra .github commit(s)); skipping clone+push"
+                        )
+                    else:
+                        log.info(
+                            f"[{name}] Already fully migrated: {len(_ls_br_shas)} branch(es), "
+                            f"{len(_ls_tag_names)} tag(s), all SHAs match"
+                            f"{_commit_info} -- skipping clone+push"
+                        )
+                    return _MirrorResult(
+                        ok=True,
+                        default_branch=_db,
+                        branch_count=len(_ls_br_shas),
+                        head_commit_sha=_db_sha,
+                        gh_branch_count=len(_gh_br_shas),
+                        gh_head_commit_sha=_current_gh_sha,
+                        tag_count=len(_ls_tag_names),
+                        gh_tag_count=len(_gh_tag_names),
+                        commit_count=_commit_count,
+                        gh_repo_url=f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}",
+                        validation_status="match",
+                        validation_notes=(
+                            "already migrated -- GitHub HEAD ahead by .github commit(s); GitLab history fully present"
+                            if _gh_ahead else
+                            "already migrated -- skipped clone+push"
+                        ),
+                        gh_head_is_ahead=_gh_ahead,
+                    )
+                log.info(
+                    f"[{name}] Incomplete migration detected: "
+                    f"{len(_missing_br)} missing branch(es), "
+                    f"{len(_missing_tg)} missing tag(s), "
+                    f"{len(_sha_mismatch)} SHA mismatch(es) -- proceeding with full clone+push"
+                )
+            # ls-remote returned empty refs (source empty or network error) -- fall through
 
         log.info(f"[{name}] Cloning {safe_clone}")
         ok, err = _git_with_retry(
@@ -2808,6 +3150,7 @@ def _write_reports(
 ) -> None:
     """Write timestamped JSON and XLSX (or CSV fallback) reports to the reports folder."""
     succeeded = [r for r in results if r.status == "succeeded"]
+    partial   = [r for r in results if r.status == "partial"]
     failed    = [r for r in results if r.status == "failed"]
     skipped   = [r for r in results if r.status == "skipped"]
     dry_run   = [r for r in results if r.status == "dry-run"]
@@ -2825,14 +3168,15 @@ def _write_reports(
         "total_elapsed_seconds": round(elapsed_seconds, 1),
         "summary": {
             "total_in_csv": len(config.repos),
-            "processed_this_run": len(succeeded) + len(failed) + len(dry_run),
+            "processed_this_run": len(succeeded) + len(partial) + len(failed) + len(dry_run),
             "succeeded": len(succeeded),
+            "partial": len(partial),
             "failed": len(failed),
             "skipped_already_done": len(skipped),
             "dry_run": len(dry_run),
             "success_rate": (
-                f"{len(succeeded)/( len(succeeded)+len(failed) )*100:.1f}%"
-                if (len(succeeded) + len(failed)) else "N/A"
+                f"{len(succeeded)/( len(succeeded)+len(partial)+len(failed) )*100:.1f}%"
+                if (len(succeeded) + len(partial) + len(failed)) else "N/A"
             ),
         },
         "timing_metrics": _compute_metrics(results),
@@ -2862,6 +3206,9 @@ def _write_reports(
                 "ci_skeleton_branches_created": r.ci_skeleton_branches_created,
                 "ci_skeleton_branches_skipped": r.ci_skeleton_branches_skipped,
                 "ci_skeleton_error": r.ci_skeleton_error,
+                "custom_properties_status": r.custom_properties_status,
+                "custom_properties_applied": r.custom_properties_applied,
+                "custom_properties_error": r.custom_properties_error,
                 "error": r.error,
                 "duration_seconds": round(r.duration_seconds, 1),
                 "duration_minutes": round(r.duration_seconds / 60, 2),
@@ -2908,11 +3255,16 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
             "validation_status", "validation_notes",
             "missing_branches", "missing_tags", "branch_sha_mismatches",
             "lfs_detected", "lfs_object_count",
+            "custom_properties_status", "custom_properties_applied", "custom_properties_error",
             "ci_skeleton_status", "ci_skeleton_branches_created",
             "ci_skeleton_branches_skipped", "ci_skeleton_error",
             "error", "completed_at",
         ])
         for r in results:
+            _cp_str = (
+                "; ".join(f"{k}={v!r}" for k, v in r.custom_properties_applied.items())
+                if r.custom_properties_applied else ""
+            )
             writer.writerow([
                 r.source, r.target, r.gh_repo_url, r.status, r.visibility,
                 r.default_branch, r.default_branch_renamed,
@@ -2925,6 +3277,9 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
                 "; ".join(r.branch_sha_mismatches) if r.branch_sha_mismatches else "",
                 "Yes" if r.lfs_detected else "No",
                 r.lfs_object_count or "",
+                r.custom_properties_status,
+                _cp_str,
+                r.custom_properties_error,
                 r.ci_skeleton_status,
                 "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
                 "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "",
@@ -2952,9 +3307,10 @@ def _write_xlsx(
     HDR_FONT     = Font(bold=True, color="FFFFFF", size=10)
     STATUS_FILLS = {
         "succeeded": _fill("C6EFCE"),
+        "partial":   _fill("FFEB9C"),
         "failed":    _fill("FFC7CE"),
         "skipped":   _fill("F2F2F2"),
-        "dry-run":   _fill("FFEB9C"),
+        "dry-run":   _fill("BDD7EE"),
     }
     VAL_FILLS = {
         "match":    _fill("C6EFCE"),
@@ -3006,6 +3362,7 @@ def _write_xlsx(
         return ""
 
     succeeded  = [r for r in results if r.status == "succeeded"]
+    partial    = [r for r in results if r.status == "partial"]
     failed     = [r for r in results if r.status == "failed"]
     skipped    = [r for r in results if r.status == "skipped"]
     dry_run_rs = [r for r in results if r.status == "dry-run"]
@@ -3053,11 +3410,12 @@ def _write_xlsx(
     _sum_row("", "")
     _sum_row("MIGRATION RESULTS", "", is_section=True)
     _sum_row("Total Repos in CSV",         str(len(config.repos)))
-    _sum_row("Succeeded",                  str(len(succeeded)))
+    _sum_row("Succeeded (fully)",          str(len(succeeded)))
+    _sum_row("Partial (git ok, sub-step failed)", str(len(partial)))
     _sum_row("Failed",                     str(len(failed)))
-    _processed = len(succeeded) + len(failed)
+    _processed = len(succeeded) + len(partial) + len(failed)
     _srate = f"{len(succeeded)}/{_processed} ({len(succeeded)/_processed*100:.1f}%)" if _processed else "N/A"
-    _sum_row("Success Rate",               _srate)
+    _sum_row("Full-Success Rate",          _srate)
     _sum_row("Skipped (already migrated)", str(len(skipped)))
     _sum_row("Dry-Run Simulated",          str(len(dry_run_rs)))
     _sum_row("", "")
@@ -3074,11 +3432,18 @@ def _write_xlsx(
         _sum_row("Min / Max per Repo",
                  f"{m.get('min_seconds', 0)}s  /  {m.get('max_seconds', 0)}s")
         _sum_row("Mean per Repo", f"{m.get('mean_seconds', 0)}s")
-    if failed:
+    if failed or partial:
         _sum_row("", "")
-        _sum_row("FAILED REPOSITORIES", "", is_section=True)
+        _sum_row("FAILED / PARTIAL REPOSITORIES", "", is_section=True)
         for r in failed:
-            _sum_row(r.source, r.error[:120] if r.error else "\u2014")
+            _sum_row(r.source, f"FAILED: {r.error[:110]}" if r.error else "FAILED")
+        for r in partial:
+            parts = []
+            if r.custom_properties_status == "failed":
+                parts.append(f"props: {r.custom_properties_error[:60]}")
+            if r.ci_skeleton_status == "failed":
+                parts.append(f"ci: {r.ci_skeleton_error[:60]}")
+            _sum_row(r.source, "PARTIAL: " + "; ".join(parts) if parts else "PARTIAL")
 
     # =========================================================================
     # Sheet 2: Repositories (team leads -- full list with GitHub URLs)
@@ -3088,37 +3453,56 @@ def _write_xlsx(
         "Source (GitLab)", "Target (GitHub)", "GitHub URL",
         "Status", "Visibility", "Default Branch", "Renamed to main",
         "Branches Pushed", "Tags Pushed", "LFS Detected", "LFS Objects",
-        "Duration (min)", "Completed At", "Error",
+        "Custom Props Status", "Custom Props Applied", "Custom Props Error",
         "CI Skeleton", "CI Branches Created", "CI Branches Skipped", "CI Error",
+        "Duration (min)", "Completed At", "Git Error",
     ])
+    CP_STATUS_FILLS = {
+        "applied":        _fill("C6EFCE"),
+        "skipped":        _fill("F2F2F2"),
+        "not_configured": _fill("F2F2F2"),
+        "failed":         _fill("FFC7CE"),
+        "dry-run":        _fill("BDD7EE"),
+    }
     for ri, r in enumerate(results, 2):
         rf = STATUS_FILLS.get(r.status, _fill("FFFFFF"))
+        cp_fill = CP_STATUS_FILLS.get(r.custom_properties_status, rf)
         ci_fill = (
             _fill("C6EFCE") if r.ci_skeleton_status == "created" else
             _fill("FFEB9C") if r.ci_skeleton_status in ("partial", "skipped_all") else
             _fill("FFC7CE") if r.ci_skeleton_status == "failed" else
             rf
         )
+        _cp_applied_str = (
+            ", ".join(f"{k}={v!r}" for k, v in r.custom_properties_applied.items())
+            if r.custom_properties_applied else ""
+        )
         vals = [
             r.source, r.target, None,
             r.status,
             r.visibility or "\u2014",
             r.default_branch or "\u2014",
-            "Yes" if r.default_branch_renamed else ("No" if r.status == "succeeded" else ""),
+            "Yes" if r.default_branch_renamed else ("No" if r.status in ("succeeded", "partial") else ""),
             r.branch_count or "",
             r.tag_count or "",
-            "Yes" if r.lfs_detected else ("No" if r.status == "succeeded" else ""),
+            "Yes" if r.lfs_detected else ("No" if r.status in ("succeeded", "partial") else ""),
             r.lfs_object_count if r.lfs_detected else "",
-            round(r.duration_seconds / 60, 2) if r.duration_seconds else "",
-            r.completed_at,
-            r.error,
+            r.custom_properties_status or "",
+            _cp_applied_str,
+            r.custom_properties_error or "",
             r.ci_skeleton_status or "",
             "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
             "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "",
-            r.ci_skeleton_error,
+            r.ci_skeleton_error or "",
+            round(r.duration_seconds / 60, 2) if r.duration_seconds else "",
+            r.completed_at,
+            r.error or "",
         ]
-        # Columns that should wrap: Error(14), CI Error(18)
-        _wrap_cols_repos = {14, 18}
+        # Columns that should wrap: Custom Props Applied(13), CP Error(14), CI Error(18), Git Error(21)
+        _wrap_cols_repos = {13, 14, 18, 21}
+        # Column fill: cp cols 12-14 use cp_fill; ci cols 15-18 use ci_fill; rest use rf
+        _cp_cols  = {12, 13, 14}
+        _ci_cols  = {15, 16, 17, 18}
         for ci, val in enumerate(vals, 1):
             if ci == 3:
                 if r.gh_repo_url:
@@ -3126,9 +3510,9 @@ def _write_xlsx(
                     ws_repos.cell(ri, ci).fill = rf
                 continue
             c = ws_repos.cell(row=ri, column=ci, value=val)
-            c.fill = ci_fill if ci >= 15 else rf
+            c.fill = cp_fill if ci in _cp_cols else ci_fill if ci in _ci_cols else rf
             c.alignment = WRAP if ci in _wrap_cols_repos else LEFT
-    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 16, 12, 12, 12, 14, 22, 45, 14, 30, 30, 40])
+    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 14, 12, 12, 12, 18, 42, 40, 14, 30, 30, 40, 14, 22, 45])
 
     # =========================================================================
     # Sheet 3: Failed & Mismatches (engineers -- actionable only)
@@ -3136,14 +3520,22 @@ def _write_xlsx(
     ws_fail = wb.create_sheet("Failed & Mismatches")
     _header_row(ws_fail, [
         "Source (GitLab)", "Target (GitHub)", "GitHub URL",
-        "Issue Type", "Error / Mismatch Detail", "Recommended Action",
+        "Issue Type", "Sub-step", "Error / Mismatch Detail", "Recommended Action",
     ])
-    action_rows = [r for r in results if r.status == "failed" or r.validation_status == "mismatch"]
-    for ri, r in enumerate(action_rows, 2):
-        issue_type = "Failed" if r.status == "failed" else "Validation Mismatch"
-        detail = r.error if r.status == "failed" else r.validation_notes
+    action_rows: list[tuple] = []
+    for r in results:
+        if r.status == "failed":
+            action_rows.append((r, "Failed", "git", r.error))
+        elif r.status == "partial":
+            if r.custom_properties_status == "failed":
+                action_rows.append((r, "Partial", "custom-properties", r.custom_properties_error))
+            if r.ci_skeleton_status == "failed":
+                action_rows.append((r, "Partial", "ci-skeleton", r.ci_skeleton_error))
+        elif r.validation_status == "mismatch":
+            action_rows.append((r, "Validation Mismatch", "git-validate", r.validation_notes))
+    for ri, (r, issue_type, substep, detail) in enumerate(action_rows, 2):
         rf = STATUS_FILLS.get(r.status, VAL_FILLS.get(r.validation_status, _fill("FFFFFF")))
-        vals = [r.source, r.target, None, issue_type, detail, _recommended_action(r)]
+        vals = [r.source, r.target, None, issue_type, substep, detail, _recommended_action(r)]
         for ci, val in enumerate(vals, 1):
             if ci == 3:
                 if r.gh_repo_url:
@@ -3152,8 +3544,8 @@ def _write_xlsx(
                 continue
             c = ws_fail.cell(row=ri, column=ci, value=val)
             c.fill = rf
-            c.alignment = WRAP if ci in (5, 6) else LEFT
-    _col_widths(ws_fail, [42, 38, 52, 20, 55, 55])
+            c.alignment = WRAP if ci in (6, 7) else LEFT
+    _col_widths(ws_fail, [42, 38, 52, 16, 20, 55, 55])
     if not action_rows:
         ws_fail.cell(row=2, column=1,
             value="\u2705  No failures or mismatches. All repositories migrated successfully.")
@@ -3166,15 +3558,28 @@ def _write_xlsx(
         "Source (GitLab)", "Target (GitHub)", "GitHub URL", "Migration Status",
         "Src Branches", "GH Branches", "Branches \u2713/\u2717",
         "Src Tags", "GH Tags", "Tags \u2713/\u2717",
-        "Src HEAD (10)", "GH HEAD (10)", "HEAD \u2713/\u2717",
+        # Column K: GitLab HEAD at time of push
+        # Column L: GitHub HEAD at time of push (should equal K; may differ if
+        #           .github CI skeleton was added after push -- see column M note)
+        "GitLab HEAD (push)", "GitHub HEAD (push)", "HEAD \u2713/\u2717",
         "Default Branch", "Renamed to main",
         "Validation Status", "Validation Notes",
         "Missing Branches", "Missing Tags", "Branch SHA Mismatches",
     ])
+    # Tooltip / note fills for the ahead-case HEAD match cell
+    _AHEAD_FILL = _fill("E2EFDA")   # soft green -- "match, but GitHub is ahead"
     for ri, r in enumerate(
         (r for r in results if r.status not in ("skipped", "dry-run")), 2
     ):
         rf = VAL_FILLS.get(r.validation_status, _fill("FFFFFF"))
+        # HEAD match logic: if GitHub is strictly ahead of GitLab (e.g. .github
+        # CI skeleton commit was added), the migration is still correct -- GitLab
+        # history is fully present.  Show ✓* instead of ✗.
+        _head_match: str
+        if r.gh_head_is_ahead:
+            _head_match = "\u2713*"  # ✓* = match with extra commits
+        else:
+            _head_match = _match_icon(r.head_commit_sha, r.gh_head_commit_sha)
         vals = [
             r.source, r.target, None,
             r.status,
@@ -3186,7 +3591,7 @@ def _write_xlsx(
             _match_icon(r.tag_count, r.gh_tag_count),
             r.head_commit_sha[:10] if r.head_commit_sha else "",
             r.gh_head_commit_sha[:10] if r.gh_head_commit_sha else "",
-            _match_icon(r.head_commit_sha, r.gh_head_commit_sha),
+            _head_match,
             r.default_branch or "\u2014",
             "Yes" if r.default_branch_renamed else "No",
             r.validation_status,
@@ -3205,7 +3610,13 @@ def _write_xlsx(
                     ws_val.cell(ri, ci).fill = rf
                 continue
             c = ws_val.cell(row=ri, column=ci, value=val)
-            c.fill = rf
+            # Column 13 = "HEAD ✓/✗": use soft-green fill when GitHub is ahead
+            # (migration correct -- GitLab history present -- GitHub just has
+            # extra .github CI skeleton commits on top).
+            if ci == 13 and r.gh_head_is_ahead:
+                c.fill = _AHEAD_FILL
+            else:
+                c.fill = rf
             c.alignment = WRAP if ci in _wrap_cols else LEFT
     _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 18, 16, 18, 50, 45, 45, 55])
 
@@ -3256,7 +3667,41 @@ def _write_xlsx(
         _met_row("Mean per Repo",  f"{m.get('mean_seconds', 0)}s")
 
     # =========================================================================
-    # Sheet 6: CI Skeleton Results
+    # Sheet 6: Custom Properties Results
+    # =========================================================================
+    ws_cp = wb.create_sheet("Custom Properties")
+    _header_row(ws_cp, [
+        "Target (GitHub)", "GitHub URL",
+        "Status", "Properties Applied", "Error",
+    ])
+    cp_rows = [r for r in results if r.status not in ("skipped",)]
+    for ri, r in enumerate(cp_rows, 2):
+        rf = CP_STATUS_FILLS.get(r.custom_properties_status, STATUS_FILLS.get(r.status, _fill("FFFFFF")))
+        _cp_str = (
+            "\n".join(f"{k} = {v!r}" for k, v in r.custom_properties_applied.items())
+            if r.custom_properties_applied else "\u2014"
+        )
+        cp_vals = [
+            r.target, None,
+            r.custom_properties_status or "not_configured",
+            _cp_str,
+            r.custom_properties_error or "",
+        ]
+        for ci, val in enumerate(cp_vals, 1):
+            if ci == 2:
+                if r.gh_repo_url:
+                    _hyperlink_cell(ws_cp, ri, ci, r.gh_repo_url, r.gh_repo_url)
+                    ws_cp.cell(ri, ci).fill = rf
+                continue
+            c = ws_cp.cell(row=ri, column=ci, value=val)
+            c.fill = rf
+            c.alignment = WRAP if ci in (4, 5) else LEFT
+    _col_widths(ws_cp, [45, 52, 18, 55, 50])
+    if not cp_rows:
+        ws_cp.cell(row=2, column=1, value="\u2139\ufe0f  No repos processed this run.")
+
+    # =========================================================================
+    # Sheet 7: CI Skeleton Results
     # =========================================================================
     ws_ci = wb.create_sheet("CI Skeleton")
     _header_row(ws_ci, [
@@ -3310,29 +3755,108 @@ def _migrate_one(
 ) -> _RepoResult:
     """Migrate one repository. Designed to be submitted to a ThreadPoolExecutor."""
     key = f"{spec.namespace}/{spec.project}"
+    target_key = f"{spec.target_org}/{spec.target_name}"
+    name = spec.target_name
     t_start = time.monotonic()
 
+    # ── Step 1: git clone + push + validate ─────────────────────────────────
     mr = _mirror_repo(spec, config, client)
-    if config.dry_run:
-        status = "dry-run"
-    else:
-        status = "succeeded" if mr.ok else "failed"
-        state.record(key, status)
 
-    # Post-push: CI skeleton creation (failures recorded but don't affect migration status).
+    # ── Step 2: Custom properties ────────────────────────────────────────────
+    cp_status = "not_configured"
+    cp_applied: dict = {}
+    cp_error = ""
+
+    if config.dry_run:
+        cp_status = "dry-run"
+    elif mr.ok:
+        _raw_props = config.repo_custom_properties.get(target_key)
+        if _raw_props:
+            _schema = config._org_property_schemas.get(spec.target_org, {})
+            _ok, _err = _set_repo_properties(
+                client, spec.target_org, name, _raw_props, target_key,
+                schema_map=_schema,
+            )
+            if _ok:
+                cp_status = "applied"
+                # Coerce values for display (mirrors what _set_repo_properties sends)
+                cp_applied = {
+                    k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
+                    for k, v in _raw_props.items()
+                }
+                log.info(
+                    f"[{name}] Custom properties applied ({len(cp_applied)}): "
+                    + ", ".join(
+                        f"{k}={v!r}" for k, v in cp_applied.items()
+                    )
+                )
+            else:
+                cp_status = "failed"
+                cp_error = _err
+                log.warning(f"[{name}] Custom properties FAILED: {_err}")
+        else:
+            cp_status = "skipped"
+            log.debug(f"[{name}] Custom properties: not in repo-properties.csv -- skipped")
+
+    # ── Step 3: CI skeleton ──────────────────────────────────────────────────
     ci_result = _CiSkeletonResult(status="not_configured")
     if config.ci_skeleton and config.ci_skeleton.enabled:
         if config.dry_run or mr.ok:
             ci_result = _create_ci_skeleton(spec, config, client, mr.default_branch)
-            if ci_result.status not in ("not_configured", "dry-run", "created", "skipped_all"):
-                log.warning(
-                    f"[{spec.target_name}] CI skeleton status: {ci_result.status}"
-                    + (f" | {ci_result.error}" if ci_result.error else "")
+            if ci_result.status == "created":
+                log.info(
+                    f"[{name}] CI skeleton created on: "
+                    + ", ".join(ci_result.branches_created)
                 )
+            elif ci_result.status == "skipped_all":
+                log.info(
+                    f"[{name}] CI skeleton: already exists on all target branches -- skipped"
+                )
+            elif ci_result.status == "partial":
+                log.warning(
+                    f"[{name}] CI skeleton partial: created={ci_result.branches_created}, "
+                    f"skipped={ci_result.branches_skipped}"
+                    + (f", error={ci_result.error}" if ci_result.error else "")
+                )
+            elif ci_result.status == "failed":
+                log.warning(
+                    f"[{name}] CI skeleton FAILED: {ci_result.error}"
+                )
+
+    # ── Determine overall status ─────────────────────────────────────────────
+    # "succeeded"  : git ok AND (no props configured OR props applied) AND (CI not failed)
+    # "partial"    : git ok BUT props or CI had a non-blocking failure
+    # "failed"     : git push/validate failed (hard failure)
+    if config.dry_run:
+        status = "dry-run"
+    elif not mr.ok:
+        status = "failed"
+    else:
+        props_ok = cp_status in ("applied", "skipped", "not_configured", "dry-run")
+        ci_ok = ci_result.status not in ("failed",)
+        if props_ok and ci_ok:
+            status = "succeeded"
+        else:
+            status = "partial"
+            partial_reasons: list[str] = []
+            if not props_ok:
+                partial_reasons.append(f"custom-properties({cp_error[:80]})")
+            if not ci_ok:
+                partial_reasons.append(f"ci-skeleton({ci_result.error[:80]})")
+            log.warning(
+                f"[{name}] Migration PARTIAL -- git succeeded but: "
+                + "; ".join(partial_reasons)
+            )
+
+    if not config.dry_run:
+        # Checkpoint only marks fully succeeded or failed -- partial stays unresolved
+        # so a re-run can retry the failed sub-steps.
+        state.record(key, "succeeded" if status == "succeeded" else
+                          "failed" if status == "failed" else "partial")
 
     return _RepoResult(
         source=key,
-        target=f"{spec.target_org}/{spec.target_name}",
+        target=target_key,
         status=status,
         default_branch=mr.default_branch,
         error=mr.error,
@@ -3344,6 +3868,7 @@ def _migrate_one(
         head_commit_sha=mr.head_commit_sha,
         gh_branch_count=mr.gh_branch_count,
         gh_head_commit_sha=mr.gh_head_commit_sha,
+        gh_head_is_ahead=mr.gh_head_is_ahead,
         tag_count=mr.tag_count,
         gh_tag_count=mr.gh_tag_count,
         commit_count=mr.commit_count,
@@ -3360,6 +3885,9 @@ def _migrate_one(
         ci_skeleton_branches_created=ci_result.branches_created,
         ci_skeleton_branches_skipped=ci_result.branches_skipped,
         ci_skeleton_error=ci_result.error,
+        custom_properties_status=cp_status,
+        custom_properties_applied=cp_applied,
+        custom_properties_error=cp_error,
     )
 
 
@@ -3643,14 +4171,42 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
             elapsed = time.monotonic() - wall_start
             eta_secs = int((total - completed_count) / (completed_count / elapsed)) if completed_count < total and elapsed > 0 else 0
             eta_str = f" | ETA {eta_secs // 60}m {eta_secs % 60:02d}s" if eta_secs else ""
-            status_icon = "\u2705" if result.status == "succeeded" else "\u274c"
-            branch_info = f" \U0001f33f {result.default_branch}" if result.default_branch else ""
-            log.info(
-                f"{status_icon} [{completed_count}/{total} {pct:.1f}%{eta_str}] "
-                f"{result.source} \u2192 {result.target}{branch_info}"
+            status_icon = (
+                "\u2705" if result.status == "succeeded" else
+                "\u26a0\ufe0f" if result.status == "partial" else
+                "\u274c"
             )
+            _counter = _c(f"[{completed_count}/{total} {pct:.1f}%{eta_str}]", 2, 37)
+            _src     = _c(result.source, 1, 36)   # bold cyan
+            _tgt     = _c(result.target, 1, 96)   # bold bright-cyan
+            _arrow   = _c("\u2192", 2)             # dim arrow
+            _branch  = (
+                f" \U0001f33f {_c(result.default_branch, 92)}"
+                if result.default_branch else ""
+            )
+            _stats_parts: list[str] = []
+            if result.branch_count:
+                _stats_parts.append(f"{result.branch_count}b")
+            if result.tag_count:
+                _stats_parts.append(f"{result.tag_count}t")
+            if result.commit_count:
+                _stats_parts.append(f"{result.commit_count:,}c")
+            _stats = _c(" [" + " ".join(_stats_parts) + "]", 2, 36) if _stats_parts else ""
+            log.info(f"{status_icon} {_counter} {_src} {_arrow} {_tgt}{_branch}{_stats}")
             if result.status == "failed":
                 log.error(f"  \u26a0\ufe0f  {result.error}")
+            elif result.status == "partial":
+                # Show exactly which sub-steps passed and which failed.
+                def _step_tag(label: str, ok: bool, detail: str = "") -> str:
+                    icon   = _c("\u2705", 92) if ok else _c("\u274c", 91)
+                    suffix = _c(f" ({detail[:70]})", 2) if detail and not ok else ""
+                    return f"{icon} {label}{suffix}"
+                _cp_ok  = result.custom_properties_status in ("applied", "skipped", "not_configured", "dry-run")
+                _ci_ok  = result.ci_skeleton_status not in ("failed",)
+                _git_tag = _step_tag("git", True)
+                _cp_tag  = _step_tag("custom-props",  _cp_ok,  result.custom_properties_error)
+                _ci_tag  = _step_tag(".github",       _ci_ok,  result.ci_skeleton_error)
+                log.warning(f"  \u26a0\ufe0f  Partial  {_git_tag}  {_cp_tag}  {_ci_tag}")
 
             # Honour shutdown request: cancel any futures that haven't started yet.
             if _shutdown_event.is_set():
@@ -3663,25 +4219,70 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
 
     # Final summary
     succeeded = [r for r in results if r.status == "succeeded"]
+    partial   = [r for r in results if r.status == "partial"]
     failed    = [r for r in results if r.status == "failed"]
     skipped   = [r for r in results if r.status == "skipped"]
     elapsed   = time.monotonic() - wall_start
 
-    processed = len(succeeded) + len(failed)
+    processed = len(succeeded) + len(partial) + len(failed)
     success_rate = f"{len(succeeded)}/{processed} ({len(succeeded)/processed*100:.1f}%)" if processed else "N/A"
 
-    log.info("\u2550" * 60)
-    log.info("\U0001f3c1  Migration Run Complete")
-    log.info("\u2500" * 60)
-    log.info(f"  \u2705  Succeeded  :  {len(succeeded)}")
-    log.info(f"  \u274c  Failed     :  {len(failed)}")
-    log.info(f"  \u23ed\ufe0f  Skipped    :  {len(skipped)}  (already done)")
-    log.info(f"  \U0001f4ca  Success Rate:  {success_rate}")
-    log.info(f"  \u23f1\ufe0f  Elapsed    :  {_fmt_duration(elapsed)}")
-    log.info("\u2550" * 60)
+    _div1  = _c("\u2550" * 60, 2, 37)   # dim gray double-rule
+    _div2  = _c("\u2500" * 60, 2, 37)   # dim gray single-rule
+    log.info(_div1)
+    log.info(_c("\U0001f3c1  Migration Run Complete", 1, 97))  # bold bright-white
+    log.info(_div2)
+    log.info(f"  \u2705  Succeeded  :  {_c(str(len(succeeded)), 1, 92)}")   # bold bright-green
+    if partial:
+        log.info(
+            f"  \u26a0\ufe0f  Partial    :  {_c(str(len(partial)), 1, 93)}  "
+            + _c("(git ok; custom-props or CI skeleton failed)", 2)
+        )  # bold bright-yellow count, dim explanation
+    log.info(f"  \u274c  Failed     :  {_c(str(len(failed)),    1, 91)}")   # bold bright-red
+    log.info(f"  \u23ed\ufe0f  Skipped    :  {_c(str(len(skipped)),  2)}  {_c('(already done)', 2)}")  # dim
+    log.info(f"  \U0001f4ca  Success Rate:  {_c(success_rate, 1, 97)}")     # bold bright-white
+    log.info(f"  \u23f1\ufe0f  Elapsed    :  {_c(_fmt_duration(elapsed), 1)}")
+    # Custom properties summary
+    cp_applied  = sum(1 for r in results if r.custom_properties_status == "applied")
+    cp_failed   = sum(1 for r in results if r.custom_properties_status == "failed")
+    cp_skipped  = sum(1 for r in results if r.custom_properties_status == "skipped")
+    cp_none     = sum(1 for r in results if r.custom_properties_status == "not_configured")
+    if cp_applied or cp_failed:
+        log.info(_div2)
+        log.info(_c("  Custom Properties:", 1, 4))   # bold underline section header
+        log.info(f"    Applied    : {_c(str(cp_applied), 92)}")   # bright-green
+        if cp_failed:
+            log.info(f"    Failed     : {_c(str(cp_failed), 91)}")  # bright-red
+        if cp_skipped:
+            log.info(f"    Skipped    : {_c(str(cp_skipped), 2)}  {_c('(not in repo-properties.csv)', 2)}")
+        if cp_none:
+            log.info(f"    N/A        : {_c(str(cp_none), 2)}  {_c('(no CSV configured)', 2)}")
+    # CI skeleton (.github) summary — shown whenever CI skeleton is configured.
+    ci_created  = sum(1 for r in results if r.ci_skeleton_status == "created")
+    ci_partial  = sum(1 for r in results if r.ci_skeleton_status == "partial")
+    ci_skipped  = sum(1 for r in results if r.ci_skeleton_status == "skipped_all")
+    ci_failed   = sum(1 for r in results if r.ci_skeleton_status == "failed")
+    ci_not_cfg  = sum(1 for r in results if r.ci_skeleton_status == "not_configured")
+    if config.ci_skeleton is not None or ci_created or ci_failed or ci_partial:
+        log.info(_div2)
+        log.info(_c("  .github Folder (CI Skeleton):", 1, 4))  # bold underline section header
+        if ci_created:
+            log.info(f"    Created    : {_c(str(ci_created), 92)}")   # bright-green
+        if ci_partial:
+            log.info(f"    Partial    : {_c(str(ci_partial), 93)}")   # bright-yellow
+        if ci_skipped:
+            log.info(f"    Skipped    : {_c(str(ci_skipped), 2)}  {_c('(file already exists on branch)', 2)}")
+        if ci_failed:
+            log.info(f"    Failed     : {_c(str(ci_failed), 91)}")    # bright-red
+        if ci_not_cfg:
+            log.info(f"    N/A        : {_c(str(ci_not_cfg), 2)}  {_c('(ci_skeleton not configured)', 2)}")
+    log.info(_div1)
     if failed:
-        log.warning(f"  \u26a0\ufe0f  Failed repos: {', '.join(r.target for r in failed)}")
-        log.info("  \U0001f504  Re-run the script to retry failed repositories automatically.")
+        log.warning(f"  \u26a0\ufe0f  Failed repos: {_c(', '.join(r.target for r in failed), 1, 91)}")
+    if partial:
+        log.warning(f"  \u26a0\ufe0f  Partial repos: {_c(', '.join(r.target for r in partial), 1, 93)}")
+    if failed or partial:
+        log.info("  \U0001f504  Re-run the script to retry failed/partial sub-steps automatically.")
 
     _write_reports(results, run_started, config, elapsed_seconds=elapsed, executed_by=gh_actor)
 
@@ -3879,7 +4480,18 @@ def _set_repo_properties(
                 + ", ".join(f"{k}={v!r}" for k, v in properties.items())
             )
             return True, ""
-        err = f"HTTP {status}: {body.get('message', str(body))[:200]}"
+        raw_msg = body.get('message', str(body))[:200]
+        if status == 403:
+            err = (
+                f"HTTP 403: {raw_msg} -- "
+                "Token lacks permission to write org custom properties. "
+                "For a classic PAT: ensure the 'admin:org' scope is granted. "
+                "For a fine-grained PAT: enable 'Custom properties' (read/write) "
+                "at the organization level. "
+                "For a GitHub App: add the 'custom_properties:write' permission."
+            )
+        else:
+            err = f"HTTP {status}: {raw_msg}"
         log.warning(f"[{label}] Failed to set custom properties -- {err}")
         return False, err
     except Exception as exc:
