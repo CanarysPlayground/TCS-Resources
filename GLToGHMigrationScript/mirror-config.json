@@ -42,5 +42,24 @@
     "commit_message": "chore: add CI skeleton workflow [migration]",
     "branches": ["main", "master", "develop"],
     "skip_if_exists": true
+  },
+  "notification": {
+    "enabled": false,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "_comment_tls": "use_tls=true with port 587 (STARTTLS, recommended). Use use_ssl=true with port 465 for implicit TLS. Both false = plain SMTP (internal relay only).",
+    "use_tls": true,
+    "use_ssl": false,
+    "smtp_user": "migrations@example.com",
+    "smtp_password": "YOUR_SMTP_PASSWORD",
+    "from": "migrations@example.com",
+    "to": ["team@example.com", "manager@example.com"],
+    "cc": [],
+    "subject_prefix": "[GitMigration]",
+    "attach_report": true,
+    "attach_log_tail_lines": 200,
+    "smtp_timeout_seconds": 30
   }
+}
+
 }
