@@ -4,11 +4,14 @@ GitLab -> GitHub Mirror Migration Script
 """
 from __future__ import annotations
 import abc
+import argparse
+import base64
 import calendar
 import csv
 import datetime
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import random
 import re
@@ -21,7 +24,9 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +36,17 @@ try:
     _XLSX_AVAILABLE = True
 except ImportError:
     _XLSX_AVAILABLE = False
+
+# Git LFS availability probe -- checked once at startup, used to gate LFS migration.
+# shutil.which short-circuits on PATH hit; subprocess fallback handles PATH oddities on
+# some RHEL/Ubuntu installs where 'git-lfs' is a shell wrapper that's only on git's PATH.
+_LFS_AVAILABLE: bool = shutil.which("git-lfs") is not None or (
+    subprocess.run(
+        ["git", "lfs", "version"],
+        capture_output=True,
+        timeout=10,
+    ).returncode == 0
+)
 
 # ---------------------------------------------------------------------------
 # Python version guard
@@ -59,7 +75,7 @@ _LOGS_DIR    = _SCRIPT_DIR / "logs"
 _REPORTS_DIR = _SCRIPT_DIR / "reports"
 _LOGS_DIR.mkdir(exist_ok=True)
 _REPORTS_DIR.mkdir(exist_ok=True)
-_LOG_FILE        = _LOGS_DIR    / f"mirror-migration-{_RUN_TS}.log"
+_LOG_FILE        = _LOGS_DIR    / f"mirror-migration-{_RUN_TS}.txt"
 _RESULTS_JSON    = _REPORTS_DIR / f"mirror-migration-{_RUN_TS}.json"
 _RESULTS_CSV     = _REPORTS_DIR / f"mirror-migration-{_RUN_TS}.csv"
 _RESULTS_XLSX    = _REPORTS_DIR / f"mirror-migration-{_RUN_TS}.xlsx"
@@ -76,17 +92,30 @@ _GITHUB_URL = "https://github.com"
 # Pause API calls when remaining quota falls below this threshold.
 _RATE_LIMIT_BUFFER = 100
 
+# GitHub hard limit per file object (non-LFS).  Pushes containing any blob
+# larger than this are rejected by GitHub's receive-pack with an HTTP 400 error.
+_GITHUB_FILE_SIZE_LIMIT_MB = 100
+
 # Maximum repository rows displayed in the pre-flight preview table.
 # Repos beyond this limit are summarised as "... and N more".
 _PREVIEW_MAX_ROWS = 25
 
 # Default migration settings (all overridable in mirror-config.json)
 _DEFAULT_MAX_WORKERS = 5
-_DEFAULT_CLONE_TIMEOUT = 7200   # seconds
-_DEFAULT_PUSH_TIMEOUT = 7200    # seconds
+_DEFAULT_CLONE_TIMEOUT = 7200        # seconds
+_DEFAULT_PUSH_TIMEOUT = 7200         # seconds
 _DEFAULT_GIT_RETRIES = 3
 _DEFAULT_API_RETRIES = 5
-_DEFAULT_MIN_FREE_DISK_GB = 10.0  # minimum free disk space in system temp dir (GB)
+_DEFAULT_MIN_FREE_DISK_GB = 10.0     # minimum free disk space in system temp dir (GB)
+# Raise git's HTTP POST buffer to avoid "RPC failed; curl 55 / send-pack: unexpected
+# disconnect" on large mirror pushes.  Configurable via mirror-config.json
+# migration.git_http_post_buffer_bytes.  Default: 500 MB.
+_DEFAULT_GIT_HTTP_POST_BUFFER = 500 * 1024 * 1024  # bytes
+# Push refs in batches to avoid GitHub HTTP 500 on large repos.  A single
+# git push --mirror creates one giant pack file; batching keeps each pack
+# small enough for GitHub's receive-pack to accept.  Configurable via
+# mirror-config.json migration.git_push_batch_size.  Default: 100 refs/batch.
+_DEFAULT_PUSH_BATCH_SIZE = 100
 
 
 _PLACEHOLDER_TOKENS = (
@@ -111,6 +140,85 @@ def _fmt_duration(seconds: float) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def _safe_dir_name(name: str) -> str:
+    """Return a filesystem-safe directory name compatible with Linux and Windows.
+
+    Replaces characters that are illegal on Windows NTFS (<>:"/\\|?*) and NUL/control
+    bytes that cause issues on Linux.  Trims trailing dots and spaces (NTFS restriction).
+    Falls back to '_repo' if the entire name is stripped away.
+    """
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    sanitized = sanitized.rstrip(". ")
+    return sanitized or "_repo"
+
+
+def _is_lfs_repo(mirror_dir: Path) -> bool:
+    """Return True if the bare mirror clone contains any Git LFS pointer objects.
+
+    Uses 'git lfs ls-files --all' which scans all refs and reports LFS-tracked files.
+    Returns False if git-lfs is not installed or produces no output.
+    """
+    code, out, _ = _run_git(
+        ["git", "lfs", "ls-files", "--all"],
+        cwd=mirror_dir,
+        timeout=60,
+    )
+    return code == 0 and bool(out.strip())
+
+
+def _git_lfs_fetch_all(mirror_dir: Path, label: str, timeout: int) -> tuple[bool, str]:
+    """Download all LFS objects from the GitLab remote into the bare clone's LFS store.
+
+    The bare mirror clone has 'origin' pointing to the authenticated GitLab URL (set
+    at clone time), so no extra credential setup is needed here.
+    """
+    code, _, err = _run_git(
+        ["git", "lfs", "fetch", "--all"],
+        cwd=mirror_dir,
+        timeout=timeout,
+    )
+    if code != 0:
+        return False, f"git lfs fetch --all failed: {err}"
+    log.info(f"[{label}] LFS fetch complete")
+    return True, ""
+
+
+def _git_lfs_push_all(
+    mirror_dir: Path,
+    push_url: str,
+    safe_push: str,
+    label: str,
+    timeout: int,
+    http_post_buffer: int,
+) -> tuple[bool, str]:
+    """Push all LFS objects from the bare clone's LFS store to GitHub.
+
+    'git lfs push --all <url>' uploads every LFS object reachable from any ref,
+    independently of the normal git push.  We use the same authenticated push URL.
+    """
+    code, _, err = _run_git(
+        cmd=["git", "lfs", "push", "--all", push_url],
+        log_cmd=["git", "lfs", "push", "--all", safe_push],
+        cwd=mirror_dir,
+        timeout=timeout,
+        http_post_buffer=http_post_buffer,
+    )
+    if code != 0:
+        return False, f"git lfs push --all failed: {err}"
+    log.info(f"[{label}] LFS push complete")
+    return True, ""
+
+
+def _count_lfs_objects(mirror_dir: Path) -> int:
+    """Return the number of distinct LFS objects in the bare clone."""
+    code, out, _ = _run_git(
+        ["git", "lfs", "ls-files", "--all"],
+        cwd=mirror_dir,
+        timeout=60,
+    )
+    return sum(1 for line in out.splitlines() if line.strip()) if code == 0 else 0
 
 # ---------------------------------------------------------------------------
 # Colored console logging
@@ -186,7 +294,11 @@ def _build_logger() -> logging.Logger:
         )
     )
 
-    file_handler = logging.FileHandler(str(_LOG_FILE), encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        str(_LOG_FILE), encoding="utf-8",
+        maxBytes=100 * 1024 * 1024,  # 100 MB per segment; prevents multi-GB log files on long runs
+        backupCount=5,
+    )
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     )
@@ -517,6 +629,18 @@ class RepoSpec:
     branch_include: list[str] = field(default_factory=list)  # per-repo include patterns
     branch_exclude: list[str] = field(default_factory=list)  # per-repo exclude patterns
     branch_from_global: bool = False  # True when both columns were blank → inherited from global config
+    ci_template: str = ""              # filename inside ci-templates/; blank → uses default.yml
+
+
+@dataclass
+class CiSkeletonConfig:
+    """Settings for the CI skeleton workflow creation step (runs after each successful push)."""
+    enabled: bool = True
+    templates_dir: Path = field(default_factory=lambda: _SCRIPT_DIR / "ci-templates")
+    target_path: str = ".github/workflows"   # folder path inside the repo (no trailing slash)
+    commit_message: str = "chore: add CI skeleton workflow"
+    branches: list[str] = field(default_factory=lambda: ["main", "master", "develop"])
+    skip_if_exists: bool = True              # never overwrite an existing file at the resolved path
 
 
 @dataclass
@@ -536,6 +660,13 @@ class MigrationConfig:
     branch_include: list[str] = field(default_factory=list)  # regex include patterns; empty = all
     branch_exclude: list[str] = field(default_factory=list)  # regex exclude patterns; empty = none
     min_free_disk_gb: float = 10.0                     # min free temp-dir space before starting
+    git_http_post_buffer: int = _DEFAULT_GIT_HTTP_POST_BUFFER  # bytes; 0 = git default (~1 MB)
+    git_push_batch_size: int = _DEFAULT_PUSH_BATCH_SIZE        # refs per push; 0 = single push (not recommended for large repos)
+    lfs_enabled: bool = True                           # fetch+push LFS objects when git-lfs is available
+    detailed_commit_count: bool = False                # count commits via rev-list (slow on large repos)
+    check_oversized_files: bool = True                 # scan for blobs > 100 MB before pushing (GitHub hard limit)
+    ci_skeleton: CiSkeletonConfig | None = None        # CI skeleton creation config; None = disabled
+    repo_custom_properties: dict[str, dict[str, str]] = field(default_factory=dict)  # "org/repo" -> {prop: val}; injected at repo creation
     repos: list[RepoSpec] = field(default_factory=list)
 
 
@@ -559,8 +690,29 @@ class _RepoResult:
     commit_count: int = 0             # commit count on default branch (source bare clone)
     gh_commit_count: int = 0          # commit count on default branch on GitHub after push
     default_branch_renamed: bool = False  # True if source default branch was renamed to 'main'
-    validation_status: str = ""       # "match" | "mismatch" | "unknown" | "dry-run"
+    validation_status: str = ""       # "match" | "mismatch" | "unknown" | "dry-run" | "empty"
     validation_notes: str = ""        # human-readable diff notes
+    # Structured mismatch detail -- populated when validation_status == "mismatch"
+    missing_branches: list[str] = field(default_factory=list)       # source branches absent on GitHub
+    missing_tags: list[str] = field(default_factory=list)           # source tags absent on GitHub
+    branch_sha_mismatches: list[str] = field(default_factory=list)  # "branch: src_sha != gh_sha"
+    # LFS migration detail
+    lfs_detected: bool = False          # True if LFS objects were found in the source repo
+    lfs_object_count: int = 0           # number of LFS objects migrated
+    # CI skeleton creation detail (populated after successful push when ci_skeleton is enabled)
+    ci_skeleton_status: str = ""        # "created" | "partial" | "skipped_all" | "failed" | "not_configured" | "dry-run"
+    ci_skeleton_branches_created: list[str] = field(default_factory=list)
+    ci_skeleton_branches_skipped: list[str] = field(default_factory=list)
+    ci_skeleton_error: str = ""
+
+
+@dataclass
+class _CiSkeletonResult:
+    """Return type of _create_ci_skeleton."""
+    status: str      # "created" | "partial" | "skipped_all" | "failed" | "not_configured" | "dry-run"
+    branches_created: list[str] = field(default_factory=list)
+    branches_skipped: list[str] = field(default_factory=list)
+    error: str = ""
 
 
 @dataclass
@@ -581,6 +733,11 @@ class _MirrorResult:
     default_branch_renamed: bool = False
     validation_status: str = ""
     validation_notes: str = ""
+    missing_branches: list[str] = field(default_factory=list)
+    missing_tags: list[str] = field(default_factory=list)
+    branch_sha_mismatches: list[str] = field(default_factory=list)
+    lfs_detected: bool = False
+    lfs_object_count: int = 0
 
 
 # ===========================================================================
@@ -633,8 +790,15 @@ def _run_git(
     cwd: Path | None = None,
     timeout: int = 3600,
     log_cmd: list[str] | None = None,
+    http_post_buffer: int = 0,
+    stream_stderr: bool = False,
 ) -> tuple[int, str, str]:
+    """Run a git command.
 
+    When *stream_stderr* is True a background thread reads stderr line-by-line
+    and logs each non-empty line at INFO level as it arrives, so long-running
+    push/fetch operations show real-time progress instead of silence.
+    """
     display = " ".join(log_cmd if log_cmd is not None else cmd)
     log.debug(f"git: {display}")
 
@@ -643,31 +807,121 @@ def _run_git(
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "echo"
     # Suppress OS credential managers (Keychain on macOS, Windows Credential Manager).
-    env["GIT_CONFIG_COUNT"] = "1"
-    env["GIT_CONFIG_KEY_0"] = "credential.helper"
-    env["GIT_CONFIG_VALUE_0"] = ""
+    # Optionally raise http.postBuffer to avoid "RPC failed; curl 55" on large pushes,
+    # and disable the low-speed watchdog so slow-but-progressing transfers aren't killed.
+    extra_cfg: list[tuple[str, str]] = [("credential.helper", "")]
+    if http_post_buffer > 0:
+        extra_cfg += [
+            ("http.postBuffer", str(http_post_buffer)),
+            ("http.lowSpeedLimit", "0"),
+            ("http.lowSpeedTime", "999999"),
+        ]
+    env["GIT_CONFIG_COUNT"] = str(len(extra_cfg))
+    for i, (key, val) in enumerate(extra_cfg):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = val
 
-    kwargs: dict = {
-        "capture_output": True,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "timeout": timeout,
+    # On Linux/macOS, launch git in a new session so it becomes its own process-group
+    # leader (PGID == PID).  On timeout we can then send SIGKILL to the entire group,
+    # killing git-remote-https, git-lfs workers, and any other helpers that would
+    # otherwise become orphaned, hold sockets open, and exhaust resources when hundreds
+    # of large repos are migrated concurrently.
+    popen_kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "env": env,
         **({"cwd": str(cwd.resolve())} if cwd is not None else {}),
-        **({"creationflags": 0x08000000} if sys.platform == "win32" else {}),  # CREATE_NO_WINDOW
+        **(  # Windows: suppress console window; Linux/macOS: new session for group kill
+            {"creationflags": 0x08000000}
+            if sys.platform == "win32"
+            else {"start_new_session": True}
+        ),
     }
 
     try:
-        result = subprocess.run(cmd, **kwargs)
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
+        with subprocess.Popen(cmd, **popen_kwargs) as proc:
+            if stream_stderr:
+                # Stream stderr line-by-line in a background thread so git's
+                # progress output ("Writing objects: 45% ...") appears in the
+                # log in real-time instead of being buffered until completion.
+                # stdout is read in a separate thread so the polling loop is
+                # never blocked waiting for it, and so a process that hangs
+                # without ever closing stdout can still be killed on timeout.
+                stderr_lines: list[str] = []
+                stdout_chunks: list[bytes] = []
+
+                def _read_stderr() -> None:
+                    assert proc.stderr is not None
+                    for raw in proc.stderr:
+                        line = raw.decode("utf-8", errors="replace").rstrip()
+                        if line:
+                            stderr_lines.append(line)
+                            log.info(f"  git> {line}")
+
+                def _read_stdout() -> None:
+                    assert proc.stdout is not None
+                    while True:
+                        chunk = proc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        stdout_chunks.append(chunk)
+
+                reader = threading.Thread(target=_read_stderr, daemon=True)
+                stdout_reader = threading.Thread(target=_read_stdout, daemon=True)
+                reader.start()
+                stdout_reader.start()
+                try:
+                    # Poll for process completion; never block on stdout/stderr directly.
+                    deadline = time.monotonic() + timeout
+                    while proc.poll() is None:
+                        if time.monotonic() > deadline:
+                            # Timeout: kill process group first, then reap.
+                            if sys.platform != "win32":
+                                try:
+                                    os.killpg(proc.pid, signal.SIGKILL)
+                                except (ProcessLookupError, PermissionError, OSError):
+                                    pass
+                            proc.kill()
+                            # Join reader threads (pipe EOF after kill) then
+                            # explicitly wait() to prevent zombie processes on Linux.
+                            reader.join(timeout=5)
+                            stdout_reader.join(timeout=5)
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            return 1, "", f"git timed out after {timeout}s: {display}"
+                        time.sleep(0.25)
+                    reader.join(timeout=10)
+                    stdout_reader.join(timeout=10)
+                    stdout_b = b"".join(stdout_chunks)
+                    stderr_str = "\n".join(stderr_lines)
+                except Exception:
+                    proc.kill()
+                    reader.join(timeout=5)
+                    stdout_reader.join(timeout=5)
+                    raise
+            else:
+                try:
+                    stdout_b, stderr_b = proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    # Kill the entire process group to reap all spawned git helpers.
+                    if sys.platform != "win32":
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    proc.kill()
+                    proc.communicate()  # drain pipes; prevents zombie / resource leak
+                    return 1, "", f"git timed out after {timeout}s: {display}"
+                stderr_str = stderr_b.decode("utf-8", errors="replace").strip()
+            return (
+                proc.returncode,
+                stdout_b.decode("utf-8", errors="replace").strip(),
+                stderr_str,
+            )
     except FileNotFoundError:
-        return (
-            1, "",
-            "'git' not found on PATH. Install: https://git-scm.com/downloads",
-        )
-    except subprocess.TimeoutExpired:
-        return 1, "", f"git timed out after {timeout}s: {display}"
+        return 1, "", "'git' not found on PATH. Install: https://git-scm.com/downloads"
 
 
 # ===========================================================================
@@ -679,9 +933,19 @@ def _create_github_repo(
     org: str,
     name: str,
     visibility: str,
-) -> bool:
+    custom_properties: dict[str, str] | None = None,
+) -> tuple[bool, bool]:
+    """Create the GitHub repository.
 
-    _body = {
+    Returns (success, was_newly_created).
+    was_newly_created=False means the repo already existed (re-run scenario).
+
+    *custom_properties* is passed directly to the GitHub API as
+    ``custom_properties`` so that orgs with required properties (especially
+    those with "Require explicit user-specified values" enabled) don't reject
+    the creation with HTTP 422.
+    """
+    _body: dict = {
         "name": name,
         "private": visibility != "public",
         "auto_init": False,
@@ -689,6 +953,12 @@ def _create_github_repo(
         "has_projects": False,
         "has_wiki": False,
     }
+    if custom_properties:
+        _body["custom_properties"] = custom_properties
+        log.debug(
+            f"[{name}] Injecting {len(custom_properties)} custom propert"
+            f"{'y' if len(custom_properties) == 1 else 'ies'} into repo creation payload"
+        )
     status, resp = client.request(
         "POST",
         f"/orgs/{org}/repos",
@@ -696,12 +966,57 @@ def _create_github_repo(
     )
     if status in (200, 201):
         log.info(f"[{name}] GitHub repo created ({visibility})")
-        return True
+        return True, True
 
     msg = resp.get("message", "unknown")
-    if status == 422 and "already exists" in msg.lower():
-        log.info(f"[{name}] GitHub repo already exists")
-        return True
+    errors = resp.get("errors", [])
+
+    # GitHub returns HTTP 422 with errors[].code == "already_exists" or
+    # errors[].message containing "already" when the repo already exists.
+    # The top-level message is "Repository creation failed." -- NOT "already exists" --
+    # so we must also inspect the errors array.
+    def _repo_already_exists(message: str, errs: list) -> bool:
+        if "already exists" in message.lower():
+            return True
+        for e in errs:
+            code = (e.get("code") or "").lower()
+            emsg = (e.get("message") or "").lower()
+            if code == "already_exists" or "already" in emsg:
+                return True
+        return False
+
+    if status == 422 and _repo_already_exists(msg, errors):
+        log.info(f"[{name}] GitHub repo already exists -- will push without deleting remote refs")
+        return True, False
+
+    # HTTP 422 "does not have permission to set custom properties" -- the token
+    # lacks organization_custom_properties:write scope.  Retry WITHOUT the
+    # custom_properties field; they will be applied separately via PATCH after
+    # the push (--post-migration) or skipped with a warning if not configured.
+    def _is_custom_properties_permission_error(message: str) -> bool:
+        return "permission" in message.lower() and "custom properties" in message.lower()
+
+    if status == 422 and custom_properties and _is_custom_properties_permission_error(msg):
+        log.warning(
+            f"[{name}] Token lacks permission to set custom properties at creation time "
+            f"(HTTP 422: {msg}). Retrying repo creation without custom properties. "
+            "Apply them afterwards with: python GitMirrorMigration.py --post-migration"
+        )
+        status, resp = client.request(
+            "POST",
+            f"/orgs/{org}/repos",
+            body={k: v for k, v in {**_body, "visibility": visibility}.items()
+                  if k != "custom_properties"},
+        )
+        if status in (200, 201):
+            log.info(f"[{name}] GitHub repo created ({visibility}) [without custom properties]")
+            return True, True
+        if status == 422 and _repo_already_exists(
+            resp.get("message", ""), resp.get("errors", [])
+        ):
+            log.info(f"[{name}] GitHub repo already exists -- will push without deleting remote refs")
+            return True, False
+        msg = resp.get("message", "unknown")
 
     # org endpoint 404 means the PAT belongs to a user account, not an org.
     if status == 404:
@@ -713,11 +1028,16 @@ def _create_github_repo(
         )
         if status in (200, 201):
             log.info(f"[{name}] GitHub repo created under user account ({visibility})")
-            return True
+            return True, True
+        if status == 422 and _repo_already_exists(
+            resp.get("message", ""), resp.get("errors", [])
+        ):
+            log.info(f"[{name}] GitHub user repo already exists")
+            return True, False
         msg = resp.get("message", "unknown")
 
     log.error(f"[{name}] Failed to create GitHub repo (HTTP {status}): {msg}")
-    return False
+    return False, False
 
 
 def _get_default_branch(mirror_dir: Path) -> str:
@@ -770,6 +1090,37 @@ def _get_head_commit_sha(mirror_dir: Path, branch: str) -> str:
         timeout=15,
     )
     return out.strip() if code == 0 else ""
+
+
+def _get_git_ref_names(mirror_dir: Path, prefix: str) -> set[str]:
+    """Return the set of short ref names under *prefix* in a bare clone.
+
+    E.g. prefix='refs/heads/' -> {'main', 'develop', 'release/1.0'}
+         prefix='refs/tags/'  -> {'v1.0.0', 'v2.0.0-rc1'}
+    Returns an empty set on any git error.
+    """
+    code, out, _ = _run_git(
+        ["git", "for-each-ref", "--format=%(refname:short)", prefix],
+        cwd=mirror_dir,
+        timeout=30,
+    )
+    return {r.strip() for r in out.splitlines() if r.strip()} if code == 0 else set()
+
+
+def _get_git_branch_shas(mirror_dir: Path) -> dict[str, str]:
+    """Return {branch_name: full_commit_sha} for every branch in a bare clone."""
+    code, out, _ = _run_git(
+        ["git", "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/"],
+        cwd=mirror_dir,
+        timeout=30,
+    )
+    result: dict[str, str] = {}
+    if code == 0:
+        for line in out.splitlines():
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                result[parts[0]] = parts[1]
+    return result
 
 
 def _set_github_default_branch(
@@ -834,6 +1185,51 @@ def _get_github_head_commit_sha(
     return ""
 
 
+def _get_github_ref_names(client: GitHubClient, path: str) -> set[str]:
+    """Return all 'name' values from a paginated GitHub list endpoint.
+
+    Uses the same pagination logic as _get_github_list_count but returns names
+    instead of a count, enabling set-based comparisons against source refs.
+    """
+    page, names = 1, set()
+    while True:
+        st, resp = client.request("GET", f"{path}?per_page=100&page={page}")
+        if st != 200 or not isinstance(resp, list):
+            break
+        for item in resp:
+            n = item.get("name", "")
+            if n:
+                names.add(n)
+        if len(resp) < 100:
+            break
+        page += 1
+    return names
+
+
+def _get_github_branch_shas(client: GitHubClient, org: str, repo: str) -> dict[str, str]:
+    """Return {branch_name: commit_sha} for every branch on the GitHub repo.
+
+    The GitHub branches list endpoint includes 'commit.sha' for each entry,
+    so we get both names and SHAs in a single paginated pass.
+    """
+    page, result = 1, {}
+    while True:
+        st, resp = client.request(
+            "GET", f"/repos/{org}/{repo}/branches?per_page=100&page={page}"
+        )
+        if st != 200 or not isinstance(resp, list):
+            break
+        for item in resp:
+            branch_name = item.get("name", "")
+            sha = item.get("commit", {}).get("sha", "")
+            if branch_name and sha:
+                result[branch_name] = sha
+        if len(resp) < 100:
+            break
+        page += 1
+    return result
+
+
 def _compute_validation(
     branch_count: int,
     head_sha: str,
@@ -843,25 +1239,73 @@ def _compute_validation(
     gh_tag_count: int = 0,
     commit_count: int = 0,
     gh_commit_count: int = 0,
+    missing_branches: list[str] | None = None,
+    missing_tags: list[str] | None = None,
+    branch_sha_mismatches: list[str] | None = None,
 ) -> tuple[str, str]:
     """Compare source bare-clone data against GitHub post-push data.
+
+    Name-level checks (missing_branches, missing_tags, branch_sha_mismatches) are
+    the primary, authoritative criteria.  Count-level checks serve as a fallback
+    when the name-level data could not be gathered (API failure).
 
     Returns (validation_status, notes):
         "match"    -- all checks pass
         "mismatch" -- at least one value differs (notes describes what)
         "unknown"  -- GitHub data was not available (API error)
     """
-    if not gh_branch_count and not gh_head_sha:
-        return "unknown", "GitHub validation data unavailable"
+    _mb  = missing_branches or []
+    _mt  = missing_tags or []
+    _bsm = branch_sha_mismatches or []
+
+    # If no GitHub data came back at all, we can't validate.
+    api_unavailable = (
+        not gh_branch_count
+        and not gh_head_sha
+        and not _mb
+        and not _mt
+        and not _bsm
+    )
+    if api_unavailable:
+        return "unknown", "GitHub validation data unavailable -- API may have failed"
+
     notes: list[str] = []
-    if branch_count and gh_branch_count and branch_count != gh_branch_count:
+
+    # -- Primary: name-level checks -----------------------------------------
+    if _mb:
+        sample = ", ".join(_mb[:8])
+        suffix = f" (+{len(_mb) - 8} more)" if len(_mb) > 8 else ""
+        notes.append(f"missing branches ({len(_mb)}): {sample}{suffix}")
+
+    if _mt:
+        sample = ", ".join(_mt[:8])
+        suffix = f" (+{len(_mt) - 8} more)" if len(_mt) > 8 else ""
+        notes.append(f"missing tags ({len(_mt)}): {sample}{suffix}")
+
+    if _bsm:
+        sample = "; ".join(_bsm[:5])
+        suffix = f" (+{len(_bsm) - 5} more)" if len(_bsm) > 5 else ""
+        notes.append(f"branch SHA mismatches ({len(_bsm)}): {sample}{suffix}")
+
+    # -- Fallback: count/SHA checks (when name-level data is empty) ----------
+    if not _mb and branch_count and gh_branch_count and branch_count != gh_branch_count:
         notes.append(f"branch count: source={branch_count} github={gh_branch_count}")
-    if head_sha and gh_head_sha and head_sha != gh_head_sha:
-        notes.append(f"HEAD SHA: source={head_sha[:8]}... github={gh_head_sha[:8]}...")
-    if tag_count and gh_tag_count and tag_count != gh_tag_count:
+
+    if not _mt and tag_count and gh_tag_count and tag_count != gh_tag_count:
         notes.append(f"tag count: source={tag_count} github={gh_tag_count}")
+
+    if head_sha and gh_head_sha and head_sha != gh_head_sha:
+        notes.append(f"default-branch HEAD SHA: source={head_sha[:8]}… github={gh_head_sha[:8]}…")
+
+    # Commit count is informational only: if HEAD SHAs match the full history is
+    # present (git is content-addressed), so a count difference is never grounds
+    # for failure but we surface it in notes for transparency.
     if commit_count and gh_commit_count and commit_count != gh_commit_count:
-        notes.append(f"commit count: source={commit_count} github={gh_commit_count}")
+        notes.append(
+            f"commit count on default branch: source={commit_count} github={gh_commit_count}"
+            " (informational -- HEAD SHA is the authoritative check)"
+        )
+
     return ("mismatch", "; ".join(notes)) if notes else ("match", "")
 
 
@@ -878,15 +1322,37 @@ def _git_with_retry(
     action: str,
     cwd: Path | None = None,
     cleanup_dir: Path | None = None,
+    http_post_buffer: int = 0,
+    cmd_factory: Callable[[], tuple[list[str], list[str]]] | None = None,
+    stream_stderr: bool = False,
 ) -> tuple[bool, str]:
+    """Run a git command with retries and capped exponential backoff.
 
+    If *cmd_factory* is provided it is called fresh before every attempt to
+    produce a new (cmd, log_cmd) pair.  This is used for push operations so the
+    GitHub auth token embedded in the push URL is always current (GitHub App
+    installation tokens expire in 55 min; a large repo push with retries can
+    exceed this window).
+
+    Set *stream_stderr* to True for push/fetch operations to relay git's
+    progress output to the log in real-time.
+    """
     err = ""
     for attempt in range(max_retries):
-        code, _, err = _run_git(cmd, log_cmd=log_cmd, cwd=cwd, timeout=timeout)
+        # Always get a fresh cmd from the factory (re-fetches expiring tokens).
+        _cmd, _log_cmd = cmd_factory() if cmd_factory is not None else (cmd, log_cmd)
+        code, _, err = _run_git(
+            _cmd, log_cmd=_log_cmd, cwd=cwd, timeout=timeout,
+            http_post_buffer=http_post_buffer, stream_stderr=stream_stderr,
+        )
         if code == 0:
             return True, ""
         if attempt < max_retries - 1:
-            backoff = 30 * (attempt + 1)
+            backoff = min(300, 30 * (2 ** attempt))  # 30s → 60s → 120s … capped at 5 min
+            # GitHub HTTP 500 ("Internal Server Error") means server-side pack-processing
+            # failure or transient overload -- needs longer recovery time than network blips.
+            if "internal server error" in err.lower():
+                backoff = max(180, backoff)
             log.warning(
                 f"[{label}] {action} failed (attempt {attempt + 1}/{max_retries}). "
                 f"Retrying in {backoff}s: {err}"
@@ -946,6 +1412,260 @@ def _filter_branches(
 
 
 # ===========================================================================
+# CI skeleton -- config validation and per-repo file creation
+# ===========================================================================
+
+def _validate_ci_skeleton_config(
+    ci_cfg: CiSkeletonConfig,
+    repos: list[RepoSpec],
+) -> list[str]:
+    """Return a list of human-readable problems found in the CI skeleton configuration.
+
+    Checks performed:
+    - ci-templates/ directory exists
+    - Every ci_template filename referenced in repos.csv exists in that directory
+    - default.yml exists when any repo has a blank ci_template column
+    """
+    problems: list[str] = []
+    if not ci_cfg.templates_dir.is_dir():
+        problems.append(
+            f"ci_skeleton.templates_dir does not exist: {ci_cfg.templates_dir}. "
+            "Create the directory and add your CI template YAML files."
+        )
+        return problems  # no point checking individual files if the dir is absent
+
+    templates_referenced: set[str] = set()
+    needs_default = False
+    for spec in repos:
+        fname = (spec.ci_template or "").strip()
+        if fname:
+            templates_referenced.add(fname)
+        else:
+            needs_default = True
+
+    for fname in sorted(templates_referenced):
+        if not (ci_cfg.templates_dir / fname).exists():
+            problems.append(
+                f"CI template file not found: {ci_cfg.templates_dir.name}/{fname}. "
+                f"Add the file or correct the ci_template column in repos.csv."
+            )
+
+    if needs_default and not (ci_cfg.templates_dir / "default.yml").exists():
+        problems.append(
+            f"One or more repos have no ci_template set in repos.csv, but "
+            f"{ci_cfg.templates_dir.name}/default.yml does not exist. "
+            "Create default.yml or set ci_template for every row."
+        )
+
+    return problems
+
+
+def _create_ci_skeleton(
+    spec: RepoSpec,
+    config: MigrationConfig,
+    client: GitHubClient,
+    default_branch: str,
+) -> _CiSkeletonResult:
+    """Create the CI skeleton workflow file on each configured branch of the GitHub repo.
+
+    Resolution order for the template file:
+      1. spec.ci_template (from repos.csv ci_template column) -- if non-blank
+      2. default.yml in ci_cfg.templates_dir -- fallback when ci_template is blank
+
+    Placeholders substituted in the template:
+      {{repo_name}}       -- target repo name on GitHub
+      {{org}}             -- target GitHub organisation
+      {{default_branch}}  -- actual default branch of the repo
+
+    The resolved file path inside the repo is:
+      {ci_cfg.target_path}/{template_filename}
+    e.g. .github/workflows/java-maven.yml
+
+    When skip_if_exists=true, the file is only created on branches where
+    the exact resolved path does not yet exist (checked via GET /contents).
+    """
+    ci_cfg = config.ci_skeleton
+    if ci_cfg is None or not ci_cfg.enabled:
+        return _CiSkeletonResult(status="not_configured")
+
+    label = spec.target_name
+
+    # Resolve template filename and load content.
+    template_filename = (spec.ci_template or "").strip() or "default.yml"
+    template_path = ci_cfg.templates_dir / template_filename
+    if not template_path.exists():
+        err = (
+            f"Template file not found: {ci_cfg.templates_dir.name}/{template_filename}. "
+            "Add the file or correct the ci_template column."
+        )
+        log.error(f"[{label}] CI skeleton: {err}")
+        return _CiSkeletonResult(status="failed", error=err)
+
+    try:
+        raw_content = template_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        err = f"Cannot read template '{template_filename}': {exc}"
+        log.error(f"[{label}] CI skeleton: {err}")
+        return _CiSkeletonResult(status="failed", error=err)
+
+    # Substitute known placeholders.
+    content = (
+        raw_content
+        .replace("{{repo_name}}", spec.target_name)
+        .replace("{{org}}", spec.target_org)
+        .replace("{{default_branch}}", default_branch or "main")
+    )
+    content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+
+    # Target file path inside the repo (no leading slash).
+    target_file = f"{ci_cfg.target_path.strip('/')}/{template_filename}"
+
+    if config.dry_run:
+        log.info(
+            f"[{label}] CI skeleton: DRY RUN -- would create '{target_file}' "
+            f"using template '{template_filename}' on branches: {ci_cfg.branches}"
+        )
+        return _CiSkeletonResult(status="dry-run")
+
+    # Determine which configured branches actually exist in this repo.
+    gh_branch_names = _get_github_ref_names(
+        client, f"/repos/{spec.target_org}/{spec.target_name}/branches"
+    )
+    target_branches = [b for b in ci_cfg.branches if b in gh_branch_names]
+
+    if not target_branches:
+        log.info(
+            f"[{label}] CI skeleton: none of the configured branches "
+            f"({', '.join(ci_cfg.branches)}) exist in this repo -- skipped"
+        )
+        return _CiSkeletonResult(status="skipped_all")
+
+    log.info(
+        f"[{label}] CI skeleton: creating '{target_file}' "
+        f"(template: {template_filename}) on {len(target_branches)} branch(es): "
+        f"{', '.join(target_branches)}"
+    )
+
+    branches_created: list[str] = []
+    branches_skipped: list[str] = []
+    first_error: str = ""
+
+    # URL-encode the file path once (forward slashes are valid in GitHub's
+    # contents API path segment so we preserve them; only special chars encoded).
+    file_path_enc = "/".join(
+        urllib.parse.quote(part, safe="") for part in target_file.split("/")
+    )
+    contents_base = f"/repos/{spec.target_org}/{spec.target_name}/contents/{file_path_enc}"
+
+    for branch in target_branches:
+        branch_enc = urllib.parse.quote(branch, safe="")
+
+        if ci_cfg.skip_if_exists:
+            st, _ = client.request("GET", f"{contents_base}?ref={branch_enc}")
+            if st == 200:
+                log.info(
+                    f"[{label}] CI skeleton: '{target_file}' already exists on "
+                    f"branch '{branch}' -- skipped (skip_if_exists=true)"
+                )
+                branches_skipped.append(branch)
+                continue
+            # 404 = file absent, proceed; any other status is unexpected but we proceed anyway.
+
+        st, resp = client.request(
+            "PUT",
+            contents_base,
+            body={
+                "message": ci_cfg.commit_message,
+                "content": content_b64,
+                "branch": branch,
+            },
+        )
+        if st in (200, 201):
+            log.info(
+                f"[{label}] CI skeleton: created '{target_file}' on branch '{branch}'"
+            )
+            branches_created.append(branch)
+        else:
+            msg = resp.get("message", "unknown") if isinstance(resp, dict) else str(resp)
+            log.warning(
+                f"[{label}] CI skeleton: failed to create '{target_file}' "
+                f"on branch '{branch}' (HTTP {st}): {msg}"
+            )
+            if not first_error:
+                first_error = f"HTTP {st} on branch '{branch}': {msg}"
+
+    # Aggregate status: created | partial | skipped_all | failed.
+    if branches_created and not first_error:
+        status = "created"
+    elif branches_created and (branches_skipped or first_error):
+        status = "partial"
+    elif branches_skipped and not branches_created and not first_error:
+        status = "skipped_all"
+    else:
+        status = "failed"
+
+    log.info(
+        f"[{label}] CI skeleton summary: "
+        f"template='{template_filename}', "
+        f"created={len(branches_created)}, "
+        f"skipped(exists)={len(branches_skipped)}"
+        + (f", error='{first_error}'" if first_error else "")
+    )
+
+    return _CiSkeletonResult(
+        status=status,
+        branches_created=branches_created,
+        branches_skipped=branches_skipped,
+        error=first_error,
+    )
+
+
+# ===========================================================================
+# Oversized blob detector
+# ===========================================================================
+
+def _find_oversized_blobs(mirror_dir: Path, label: str, timeout: int = 180) -> int:
+    """Return the count of git blob objects that exceed GitHub's per-file size limit.
+
+    Uses 'git cat-file --batch-check --batch-all-objects' to inspect every
+    object in the bare clone without checking it out.  Only blob (file content)
+    objects are examined; commits, trees, and tags are skipped.
+
+    A non-zero return value means the push WILL be rejected by GitHub; the
+    repository must be rewritten before migration can proceed.
+    Returns 0 on any git error (conservative: lets the push attempt continue).
+    """
+    limit_bytes = _GITHUB_FILE_SIZE_LIMIT_MB * 1024 * 1024
+    code, out, _ = _run_git(
+        [
+            "git", "cat-file",
+            "--batch-check=%(objecttype) %(objectsize)",
+            "--batch-all-objects",
+        ],
+        cwd=mirror_dir,
+        timeout=timeout,
+    )
+    if code != 0 or not out:
+        return 0
+    count = 0
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] == "blob":
+            try:
+                if int(parts[1]) > limit_bytes:
+                    count += 1
+            except ValueError:
+                pass
+    if count:
+        log.warning(
+            f"[{label}] {count} blob object(s) exceed {_GITHUB_FILE_SIZE_LIMIT_MB} MB -- "
+            "GitHub will reject the push. "
+            "Rewrite history with 'git filter-repo --strip-blobs-bigger-than 100M'."
+        )
+    return count
+
+
+# ===========================================================================
 # Core per-repo mirror operation
 # ===========================================================================
 
@@ -965,10 +1685,6 @@ def _mirror_repo(
         f"{gl_scheme}://oauth2:{config.gitlab_pat}@{gl_rest}"
         f"/{spec.namespace}/{spec.project}.git"
     )
-    push_url = (
-        f"https://{config.auth.get_token_for_git()}@"
-        f"{github_base.split('://', 1)[-1]}/{spec.target_org}/{name}.git"
-    )
     safe_clone = f"{gitlab_base}/{spec.namespace}/{spec.project}.git"
     safe_push  = f"{github_base}/{spec.target_org}/{name}.git"
 
@@ -976,11 +1692,35 @@ def _mirror_repo(
         log.info(f"[{name}] DRY RUN -- would clone {safe_clone} -> {safe_push}")
         return _MirrorResult(ok=True, default_branch="dry-run", validation_status="dry-run")
 
+    # Sanitize project name for safe temp-dir path (Windows + Linux safe).
+    safe_dir = _safe_dir_name(spec.project)
     tmp_dir = Path(tempfile.mkdtemp(prefix="gitmirror_"))
-    mirror_dir = tmp_dir / f"{spec.project}.git"
+    mirror_dir = tmp_dir / f"{safe_dir}.git"
 
     try:
-        if not _create_github_repo(client, spec.target_org, name, spec.visibility):
+        # Per-repo disk space check: concurrent workers can drain disk mid-run.
+        with _disk_lock:
+            free_gb = shutil.disk_usage(tmp_dir).free / (1024 ** 3)
+            _disk_ok = free_gb >= config.min_free_disk_gb
+        if not _disk_ok:
+            return _MirrorResult(
+                ok=False,
+                error=(
+                    f"Insufficient disk space before cloning: {free_gb:.1f} GB free, "
+                    f"need at least {config.min_free_disk_gb:.1f} GB. "
+                    "Free up space or lower migration.min_free_disk_gb."
+                ),
+            )
+
+        # Create GitHub repo if it doesn't exist yet.
+        _creation_props = config.repo_custom_properties.get(
+            f"{spec.target_org}/{spec.target_name}"
+        ) or None
+        repo_created, _ = _create_github_repo(
+            client, spec.target_org, name, spec.visibility,
+            custom_properties=_creation_props,
+        )
+        if not repo_created:
             return _MirrorResult(ok=False, error="Failed to create GitHub repository")
 
         log.info(f"[{name}] Cloning {safe_clone}")
@@ -996,23 +1736,77 @@ def _mirror_repo(
         if not ok:
             return _MirrorResult(ok=False, error=err)
 
+        # Empty repo: git clone --mirror exits 0 but produces no refs.
+        branch_count_raw = _count_git_refs(mirror_dir, "refs/heads/")
+        tag_count_raw    = _count_git_refs(mirror_dir, "refs/tags/")
+        if branch_count_raw == 0 and tag_count_raw == 0:
+            log.info(
+                f"[{name}] Source repository is empty (no branches, no tags). "
+                "GitHub repo created; nothing to push."
+            )
+            return _MirrorResult(
+                ok=True,
+                default_branch="",
+                validation_status="match",
+                validation_notes="empty repository -- no branches or tags to migrate",
+                gh_repo_url=f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}",
+            )
+
+        # Pre-push oversized blob scan: GitHub rejects blobs > 100 MB.
+        if config.check_oversized_files:
+            oversized = _find_oversized_blobs(mirror_dir, name)
+            if oversized > 0:
+                return _MirrorResult(
+                    ok=False,
+                    error=(
+                        f"{oversized} blob object(s) exceed GitHub's "
+                        f"{_GITHUB_FILE_SIZE_LIMIT_MB} MB file size limit and will cause "
+                        "the push to be rejected. Rewrite history with "
+                        "'git filter-repo --strip-blobs-bigger-than 100M', then retry."
+                    ),
+                )
+
+        # LFS: --mirror only copies pointer files; fetch + push binary objects separately.
+        lfs_detected = False
+        lfs_object_count = 0
+        if config.lfs_enabled and _LFS_AVAILABLE:
+            lfs_detected = _is_lfs_repo(mirror_dir)
+            if lfs_detected:
+                log.info(f"[{name}] Git LFS objects detected -- fetching from GitLab source...")
+                lfs_ok, lfs_err = _git_lfs_fetch_all(mirror_dir, name, config.clone_timeout)
+                if not lfs_ok:
+                    # Hard failure: the source has LFS objects but we couldn't download
+                    # them.  A soft-continue would silently leave dangling LFS pointers
+                    # on GitHub -- exactly the data-loss scenario we want to prevent.
+                    return _MirrorResult(
+                        ok=False,
+                        error=f"LFS fetch failed (data would be lost on GitHub): {lfs_err}",
+                        lfs_detected=True,
+                    )
+                lfs_object_count = _count_lfs_objects(mirror_dir)
+                log.info(f"[{name}] LFS fetch: {lfs_object_count} object(s) ready to push")
+
         _filter_branches(mirror_dir, spec.branch_include, spec.branch_exclude, name)
 
-        branch_count = _count_git_refs(mirror_dir, "refs/heads/")
-        tag_count    = _count_git_refs(mirror_dir, "refs/tags/")
-        commit_count = _count_git_commits(mirror_dir)
+        # Snapshot source state after filtering (used for validation later).
+        src_branch_names: set[str] = _get_git_ref_names(mirror_dir, "refs/heads/")
+        src_tag_names:    set[str] = _get_git_ref_names(mirror_dir, "refs/tags/")
+        src_branch_shas:  dict[str, str] = _get_git_branch_shas(mirror_dir)
+
         default_branch = _get_default_branch(mirror_dir)
         head_sha       = _get_head_commit_sha(mirror_dir, default_branch)
+        commit_count   = _count_git_commits(mirror_dir) if config.detailed_commit_count else 0
+
         if default_branch:
             log.info(
                 f"[{name}] Default branch: '{default_branch}' | "
-                f"{branch_count} branch(es) | {tag_count} tag(s) | {commit_count} commit(s)"
+                f"{len(src_branch_names)} branch(es) | {len(src_tag_names)} tag(s)"
+                + (f" | {commit_count} commit(s)" if commit_count else "")
             )
         else:
             log.warning(f"[{name}] Could not determine source default branch")
 
         # Optional: rename the source default branch to 'main' before pushing.
-        # This renames the ref in the bare clone so the mirror push lands as 'main'.
         renamed = False
         if config.rename_default_branch and default_branch and default_branch != "main":
             rc1, _, e1 = _run_git(
@@ -1027,50 +1821,366 @@ def _mirror_repo(
                 log.info(f"[{name}] Branch renamed: '{default_branch}' -> 'main' (pre-push)")
                 default_branch = "main"
                 renamed = True
+                # Refresh snapshots after rename
+                src_branch_names = _get_git_ref_names(mirror_dir, "refs/heads/")
+                src_branch_shas  = _get_git_branch_shas(mirror_dir)
             else:
                 log.warning(f"[{name}] Could not rename branch to 'main': {e1 or e2} -- pushing as-is")
 
-        log.info(f"[{name}] Pushing to {safe_push}")
-        ok, err = _git_with_retry(
-            cmd=["git", "push", "--mirror", push_url],
-            log_cmd=["git", "push", "--mirror", safe_push],
-            timeout=config.push_timeout,
-            max_retries=config.git_max_retries,
-            label=name,
-            action="Push",
-            cwd=mirror_dir,
+        gh_base_no_scheme = github_base.split("://", 1)[-1]
+
+        # Batched push: single --mirror on large repos triggers GitHub HTTP 500;
+        # explicit refspecs in batches keep each pack within receive-pack limits.
+        ref_code, ref_out, ref_err = _run_git(
+            ["git", "for-each-ref", "--format=%(refname)"],
+            cwd=mirror_dir, timeout=60,
         )
-        if not ok:
-            return _MirrorResult(ok=False, error=err)
+        if ref_code != 0:
+            return _MirrorResult(
+                ok=False,
+                error=f"Failed to enumerate refs before push: {ref_err}",
+                lfs_detected=lfs_detected,
+                lfs_object_count=lfs_object_count,
+            )
+        all_push_refs: list[str] = [r.strip() for r in ref_out.splitlines() if r.strip()]
+        if not all_push_refs:
+            log.warning(f"[{name}] No refs remain after branch filtering -- skipping push")
+        else:
+            batch_size = config.git_push_batch_size
+            if batch_size > 0 and len(all_push_refs) > batch_size:
+                ref_batches = [
+                    all_push_refs[i : i + batch_size]
+                    for i in range(0, len(all_push_refs), batch_size)
+                ]
+                log.info(
+                    f"[{name}] Splitting {len(all_push_refs)} refs into "
+                    f"{len(ref_batches)} push batches ({batch_size} refs each) "
+                    f"to avoid GitHub 500 on large packs"
+                )
+            else:
+                ref_batches = [all_push_refs]
+
+            for batch_idx, ref_batch in enumerate(ref_batches, 1):
+                n_batches = len(ref_batches)
+                batch_label = f" (batch {batch_idx}/{n_batches})" if n_batches > 1 else ""
+                refspecs = [f"+{r}:{r}" for r in ref_batch]
+
+                # Log a preview of which refs are in this batch so operators
+                # can see exactly what is being pushed.
+                _preview = ref_batch[:3] + ([f"... +{len(ref_batch) - 3} more"] if len(ref_batch) > 3 else [])
+                log.info(
+                    f"[{name}] Push{batch_label}: {len(ref_batch)} refs -- "
+                    + ", ".join(_preview)
+                )
+
+                def _push_cmd_factory(  # type: ignore[misc]
+                    _refspecs: list[str] = refspecs,
+                ) -> tuple[list[str], list[str]]:
+                    fresh_token = config.auth.get_token_for_git()
+                    push_url = f"https://{fresh_token}@{gh_base_no_scheme}/{spec.target_org}/{name}.git"
+                    return (
+                        ["git", "push", "--no-thin", push_url] + _refspecs,
+                        ["git", "push", "--no-thin", safe_push] + _refspecs,
+                    )
+
+                _batch_start = time.monotonic()
+                ok, err = _git_with_retry(
+                    cmd=[], log_cmd=[],
+                    cmd_factory=_push_cmd_factory,
+                    timeout=config.push_timeout,
+                    max_retries=config.git_max_retries,
+                    label=name,
+                    action=f"Push{batch_label}",
+                    cwd=mirror_dir,
+                    http_post_buffer=config.git_http_post_buffer,
+                    stream_stderr=True,
+                )
+                if not ok:
+                    return _MirrorResult(
+                        ok=False, error=err, lfs_detected=lfs_detected,
+                        lfs_object_count=lfs_object_count,
+                    )
+                log.info(
+                    f"[{name}] Push{batch_label} done in "
+                    f"{_fmt_duration(time.monotonic() - _batch_start)}"
+                )
+
+        # LFS push (after git objects are on GitHub).
+        if lfs_detected and lfs_object_count > 0:
+            log.info(f"[{name}] Pushing {lfs_object_count} LFS object(s) to GitHub...")
+            fresh_token = config.auth.get_token_for_git()
+            lfs_push_url = f"https://{fresh_token}@{gh_base_no_scheme}/{spec.target_org}/{name}.git"
+            lfs_ok, lfs_err = _git_lfs_push_all(
+                mirror_dir, lfs_push_url, safe_push, name,
+                config.push_timeout, config.git_http_post_buffer,
+            )
+            if not lfs_ok:
+                return _MirrorResult(
+                    ok=False,
+                    error=f"LFS push failed: {lfs_err}",
+                    lfs_detected=lfs_detected,
+                    lfs_object_count=lfs_object_count,
+                )
 
         if default_branch:
             _set_github_default_branch(client, spec.target_org, name, default_branch)
 
-        gh_repo_url  = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
-        gh_branches  = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/branches")
-        gh_tags      = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/tags")
-        gh_commits   = _get_github_list_count(client, f"/repos/{spec.target_org}/{name}/commits")
-        gh_head_sha  = _get_github_head_commit_sha(client, spec.target_org, name, default_branch)
+        gh_repo_url = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
+
+        # Post-push validation: compare branch/tag name-sets and SHAs.
+        log.info(f"[{name}] Validating migration against GitHub...")
+
+        gh_branch_shas: dict[str, str] = _get_github_branch_shas(client, spec.target_org, name)
+        gh_branch_names: set[str] = set(gh_branch_shas.keys())
+        gh_tag_names:    set[str] = _get_github_ref_names(
+            client, f"/repos/{spec.target_org}/{name}/tags"
+        )
+        gh_head_sha: str = gh_branch_shas.get(default_branch, "")
+
+        missing_branches: list[str] = sorted(src_branch_names - gh_branch_names)
+        missing_tags:     list[str] = sorted(src_tag_names - gh_tag_names)
+
+        branch_sha_mismatches: list[str] = [
+            f"{b}: src={src_branch_shas[b][:8]}…{src_branch_shas[b][-4:]} "
+            f"!= gh={gh_branch_shas[b][:8]}…{gh_branch_shas[b][-4:]}"
+            for b in sorted(src_branch_names & gh_branch_names)
+            if src_branch_shas.get(b) and gh_branch_shas.get(b)
+            and src_branch_shas[b] != gh_branch_shas[b]
+        ]
+
         v_status, v_notes = _compute_validation(
-            branch_count, head_sha, gh_branches, gh_head_sha,
-            tag_count, gh_tags, commit_count, gh_commits,
+            branch_count=len(src_branch_names),
+            head_sha=head_sha,
+            gh_branch_count=len(gh_branch_names),
+            gh_head_sha=gh_head_sha,
+            tag_count=len(src_tag_names),
+            gh_tag_count=len(gh_tag_names),
+            commit_count=commit_count,
+            gh_commit_count=0,
+            missing_branches=missing_branches,
+            missing_tags=missing_tags,
+            branch_sha_mismatches=branch_sha_mismatches,
         )
 
+        if v_status == "mismatch":
+            log.warning(f"[{name}] Initial push incomplete -- attempting targeted remediation:")
+            if missing_branches:
+                sample = ", ".join(missing_branches[:10])
+                extra  = f" (+{len(missing_branches)-10} more)" if len(missing_branches) > 10 else ""
+                log.warning(f"[{name}]   Missing branches ({len(missing_branches)}): {sample}{extra}")
+            if missing_tags:
+                sample = ", ".join(missing_tags[:10])
+                extra  = f" (+{len(missing_tags)-10} more)" if len(missing_tags) > 10 else ""
+                log.warning(f"[{name}]   Missing tags ({len(missing_tags)}): {sample}{extra}")
+            if branch_sha_mismatches:
+                sample = "; ".join(branch_sha_mismatches[:5])
+                extra  = f" (+{len(branch_sha_mismatches)-5} more)" if len(branch_sha_mismatches) > 5 else ""
+                log.warning(f"[{name}]   Branch SHA mismatches ({len(branch_sha_mismatches)}): {sample}{extra}")
+
+            # Targeted remediation: re-push only missing/diverged refs (non-destructive).
+            mismatch_branches = [m.split(":")[0] for m in branch_sha_mismatches]
+            rem_refspecs: list[str] = (
+                [f"+refs/heads/{b}:refs/heads/{b}" for b in missing_branches]
+                + [f"+refs/heads/{b}:refs/heads/{b}" for b in mismatch_branches]
+                + [f"+refs/tags/{t}:refs/tags/{t}" for t in missing_tags]
+            )
+
+            if rem_refspecs:
+                _rem_batch_size = config.git_push_batch_size
+                _rem_batches = (
+                    [
+                        rem_refspecs[i: i + _rem_batch_size]
+                        for i in range(0, len(rem_refspecs), _rem_batch_size)
+                    ]
+                    if _rem_batch_size > 0 and len(rem_refspecs) > _rem_batch_size
+                    else [rem_refspecs]
+                )
+                log.info(
+                    f"[{name}] Remediation: pushing {len(rem_refspecs)} missing/diverged "
+                    f"ref(s) in {len(_rem_batches)} batch(es)..."
+                )
+
+                rem_ok, rem_err = True, ""
+                for _rbatch_idx, _rbatch in enumerate(_rem_batches, 1):
+                    _rn = len(_rem_batches)
+                    _rlabel = f" (batch {_rbatch_idx}/{_rn})" if _rn > 1 else ""
+
+                    def _remediation_factory(  # type: ignore[misc]
+                        _rs: list[str] = _rbatch,
+                    ) -> tuple[list[str], list[str]]:
+                        fresh_token = config.auth.get_token_for_git()
+                        push_url = f"https://{fresh_token}@{gh_base_no_scheme}/{spec.target_org}/{name}.git"
+                        return (
+                            ["git", "push", push_url] + _rs,
+                            ["git", "push", safe_push] + _rs,
+                        )
+
+                    rem_ok, rem_err = _git_with_retry(
+                        cmd=[], log_cmd=[],
+                        cmd_factory=_remediation_factory,
+                        timeout=config.push_timeout,
+                        max_retries=config.git_max_retries,
+                        label=name,
+                        action=f"Remediation push{_rlabel}",
+                        cwd=mirror_dir,
+                        http_post_buffer=config.git_http_post_buffer,
+                    )
+                    if not rem_ok:
+                        break
+
+                if rem_ok:
+                    log.info(f"[{name}] Remediation push succeeded -- re-validating...")
+
+                    # Re-fetch GitHub state after remediation.
+                    gh_branch_shas = _get_github_branch_shas(client, spec.target_org, name)
+                    gh_branch_names = set(gh_branch_shas.keys())
+                    gh_tag_names = _get_github_ref_names(
+                        client, f"/repos/{spec.target_org}/{name}/tags"
+                    )
+                    gh_head_sha = gh_branch_shas.get(default_branch, "")
+
+                    missing_branches = sorted(src_branch_names - gh_branch_names)
+                    missing_tags     = sorted(src_tag_names - gh_tag_names)
+                    branch_sha_mismatches = [
+                        f"{b}: src={src_branch_shas[b][:8]}…{src_branch_shas[b][-4:]} "
+                        f"!= gh={gh_branch_shas[b][:8]}…{gh_branch_shas[b][-4:]}"
+                        for b in sorted(src_branch_names & gh_branch_names)
+                        if src_branch_shas.get(b) and gh_branch_shas.get(b)
+                        and src_branch_shas[b] != gh_branch_shas[b]
+                    ]
+
+                    v_status, v_notes = _compute_validation(
+                        branch_count=len(src_branch_names),
+                        head_sha=head_sha,
+                        gh_branch_count=len(gh_branch_names),
+                        gh_head_sha=gh_head_sha,
+                        tag_count=len(src_tag_names),
+                        gh_tag_count=len(gh_tag_names),
+                        commit_count=commit_count,
+                        gh_commit_count=0,
+                        missing_branches=missing_branches,
+                        missing_tags=missing_tags,
+                        branch_sha_mismatches=branch_sha_mismatches,
+                    )
+
+                    if v_status == "match":
+                        log.info(
+                            f"[{name}] Validation PASSED after remediation -- "
+                            f"{len(src_branch_names)} branch(es), {len(src_tag_names)} tag(s), "
+                            "all HEAD SHAs match"
+                            + (f" | LFS: {lfs_object_count} object(s) migrated" if lfs_detected else "")
+                        )
+                        return _MirrorResult(
+                            ok=True,
+                            default_branch=default_branch,
+                            branch_count=len(src_branch_names),
+                            head_commit_sha=head_sha,
+                            gh_branch_count=len(gh_branch_names),
+                            gh_head_commit_sha=gh_head_sha,
+                            tag_count=len(src_tag_names),
+                            gh_tag_count=len(gh_tag_names),
+                            commit_count=commit_count,
+                            gh_commit_count=0,
+                            gh_repo_url=gh_repo_url,
+                            default_branch_renamed=renamed,
+                            validation_status="match",
+                            validation_notes="passed after remediation push",
+                            missing_branches=[],
+                            missing_tags=[],
+                            branch_sha_mismatches=[],
+                            lfs_detected=lfs_detected,
+                            lfs_object_count=lfs_object_count,
+                        )
+
+                    log.error(
+                        f"[{name}] Still incomplete after remediation: {v_notes}"
+                    )
+                else:
+                    log.error(f"[{name}] Remediation push failed: {rem_err}")
+
+            # Remediation could not resolve all gaps -- fail the repo with full detail
+            # so the operator knows exactly what to investigate.
+            log.error(f"[{name}] Validation FAILED -- repo marked failed for re-run:")
+            if missing_branches:
+                sample = ", ".join(missing_branches[:10])
+                extra  = f" (+{len(missing_branches)-10} more)" if len(missing_branches) > 10 else ""
+                log.error(f"[{name}]   Missing branches ({len(missing_branches)}): {sample}{extra}")
+            if missing_tags:
+                sample = ", ".join(missing_tags[:10])
+                extra  = f" (+{len(missing_tags)-10} more)" if len(missing_tags) > 10 else ""
+                log.error(f"[{name}]   Missing tags ({len(missing_tags)}): {sample}{extra}")
+            if branch_sha_mismatches:
+                sample = "; ".join(branch_sha_mismatches[:5])
+                extra  = f" (+{len(branch_sha_mismatches)-5} more)" if len(branch_sha_mismatches) > 5 else ""
+                log.error(f"[{name}]   Branch SHA mismatches ({len(branch_sha_mismatches)}): {sample}{extra}")
+            return _MirrorResult(
+                ok=False,
+                error=f"Validation mismatch (persisted after remediation): {v_notes}",
+                default_branch=default_branch,
+                branch_count=len(src_branch_names),
+                head_commit_sha=head_sha,
+                gh_branch_count=len(gh_branch_names),
+                gh_head_commit_sha=gh_head_sha,
+                tag_count=len(src_tag_names),
+                gh_tag_count=len(gh_tag_names),
+                commit_count=commit_count,
+                gh_commit_count=0,
+                gh_repo_url=gh_repo_url,
+                default_branch_renamed=renamed,
+                validation_status=v_status,
+                validation_notes=v_notes,
+                missing_branches=missing_branches,
+                missing_tags=missing_tags,
+                branch_sha_mismatches=branch_sha_mismatches,
+                lfs_detected=lfs_detected,
+                lfs_object_count=lfs_object_count,
+            )
+
+        if v_status == "unknown":
+            log.warning(
+                f"[{name}] Validation INCONCLUSIVE -- GitHub API returned no data. "
+                "Repo is marked failed; re-run to retry."
+            )
+            return _MirrorResult(
+                ok=False,
+                error=f"Validation inconclusive (GitHub API returned no data): {v_notes}",
+                default_branch=default_branch,
+                branch_count=len(src_branch_names),
+                head_commit_sha=head_sha,
+                gh_repo_url=gh_repo_url,
+                default_branch_renamed=renamed,
+                validation_status=v_status,
+                validation_notes=v_notes,
+                lfs_detected=lfs_detected,
+                lfs_object_count=lfs_object_count,
+            )
+
+        log.info(
+            f"[{name}] Validation PASSED -- "
+            f"{len(src_branch_names)} branch(es), {len(src_tag_names)} tag(s), "
+            "all HEAD SHAs match"
+            + (f" | LFS: {lfs_object_count} object(s) migrated" if lfs_detected else "")
+        )
         return _MirrorResult(
             ok=True,
             default_branch=default_branch,
-            branch_count=branch_count,
+            branch_count=len(src_branch_names),
             head_commit_sha=head_sha,
-            gh_branch_count=gh_branches,
+            gh_branch_count=len(gh_branch_names),
             gh_head_commit_sha=gh_head_sha,
-            tag_count=tag_count,
-            gh_tag_count=gh_tags,
+            tag_count=len(src_tag_names),
+            gh_tag_count=len(gh_tag_names),
             commit_count=commit_count,
-            gh_commit_count=gh_commits,
+            gh_commit_count=0,
             gh_repo_url=gh_repo_url,
             default_branch_renamed=renamed,
             validation_status=v_status,
             validation_notes=v_notes,
+            missing_branches=[],
+            missing_tags=[],
+            branch_sha_mismatches=[],
+            lfs_detected=lfs_detected,
+            lfs_object_count=lfs_object_count,
         )
 
     except Exception as exc:
@@ -1102,6 +2212,8 @@ def load_repos_csv(
     required_cols = {"namespace", "project", "target_name"}
     repos: list[RepoSpec] = []
     skipped = 0
+    seen_sources: set[str] = set()   # "namespace/project" keys already queued
+    seen_targets: set[str] = set()   # "target_org/target_name" keys already queued
 
     try:
         fh = csv_path.open(encoding="utf-8-sig", newline="")
@@ -1152,8 +2264,32 @@ def load_repos_csv(
             inc = _parse_patterns(inc_raw, _global_inc)
             exc = _parse_patterns(exc_raw, _global_exc)
             from_global = not inc_raw and not exc_raw
+            ci_template = (row.get("ci_template") or "").strip()
 
-            repos.append(RepoSpec(ns, proj, tgt_org, tgt, vis, inc, exc, from_global))
+            # Duplicate detection: same source/target across rows corrupts checkpoint or GitHub repo.
+            source_key = f"{ns}/{proj}"
+            target_key = f"{tgt_org}/{tgt}"
+
+            if source_key in seen_sources:
+                log.warning(
+                    f"repos.csv row {i}: duplicate source '{source_key}' -- "
+                    "skipped to prevent double migration"
+                )
+                skipped += 1
+                continue
+
+            if target_key in seen_targets:
+                log.warning(
+                    f"repos.csv row {i}: target '{target_key}' is already used by another row -- "
+                    "two different sources would overwrite each other on GitHub; row skipped"
+                )
+                skipped += 1
+                continue
+
+            seen_sources.add(source_key)
+            seen_targets.add(target_key)
+
+            repos.append(RepoSpec(ns, proj, tgt_org, tgt, vis, inc, exc, from_global, ci_template))
 
     if skipped:
         log.warning(f"Skipped {skipped} invalid row(s) in repos.csv")
@@ -1227,6 +2363,33 @@ def _check_placeholders(raw: dict) -> None:
             f"{numbered}\n\n"
             "Fill in all values and run again."
         )
+
+
+def _load_repo_properties_for_creation(script_dir: Path) -> dict[str, dict[str, str]]:
+    """Load repo-properties.csv for injection at repo-creation time.
+
+    Returns an empty dict (silently) when the file does not exist, so the
+    feature is purely opt-in -- no file, no properties injected.
+    Logs a warning and returns an empty dict on any parse error so a bad
+    CSV never blocks the entire migration.
+    """
+    csv_path = script_dir / _REPO_PROPERTIES_CSV_FILENAME
+    if not csv_path.exists():
+        return {}
+    try:
+        props = _load_repo_properties_csv(csv_path)
+        if props:
+            log.info(
+                f"Repo custom properties loaded from {csv_path.name} "
+                f"({len(props)} repo(s)) -- will be injected at repo-creation time"
+            )
+        return props
+    except Exception as exc:
+        log.warning(
+            f"Could not load {csv_path.name} for repo-creation properties: {exc}. "
+            "Continuing without custom properties at creation time."
+        )
+        return {}
 
 
 def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
@@ -1315,6 +2478,53 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
         log.info("rename_default_branch_to_main enabled -- source default branch will be renamed to 'main'")
 
     min_free_disk_gb = float(mig.get("min_free_disk_gb", _DEFAULT_MIN_FREE_DISK_GB))
+    lfs_enabled = bool(mig.get("lfs_enabled", True))
+    detailed_commit_count = bool(mig.get("detailed_commit_count", False))
+    check_oversized_files = bool(mig.get("check_oversized_files", True))
+
+    # CI skeleton configuration.
+    ci_skeleton: CiSkeletonConfig | None = None
+    ci_skel_raw = raw.get("ci_skeleton", {})
+    if ci_skel_raw.get("enabled", False):
+        ci_templates_dir_raw = ci_skel_raw.get("templates_dir", "ci-templates")
+        ci_templates_dir = Path(ci_templates_dir_raw)
+        if not ci_templates_dir.is_absolute():
+            ci_templates_dir = (_SCRIPT_DIR / ci_templates_dir).resolve()
+
+        ci_skeleton = CiSkeletonConfig(
+            enabled=True,
+            templates_dir=ci_templates_dir,
+            target_path=ci_skel_raw.get("target_path", ".github/workflows"),
+            commit_message=ci_skel_raw.get("commit_message", "chore: add CI skeleton workflow"),
+            branches=[str(b) for b in ci_skel_raw.get("branches", ["main", "master", "develop"])],
+            skip_if_exists=bool(ci_skel_raw.get("skip_if_exists", True)),
+        )
+
+        ci_problems = _validate_ci_skeleton_config(ci_skeleton, repos)
+        if ci_problems:
+            for problem in ci_problems:
+                log.warning(f"CI skeleton config issue: {problem}")
+            # Disable if the templates directory or any file is missing -- operator must fix first.
+            log.warning(
+                "CI skeleton DISABLED due to the configuration issue(s) above. "
+                "Fix them and re-run."
+            )
+            ci_skeleton = None
+        else:
+            log.info(
+                f"CI skeleton enabled  |  "
+                f"templates_dir={ci_skeleton.templates_dir.name}  |  "
+                f"target_path={ci_skeleton.target_path}  |  "
+                f"branches={ci_skeleton.branches}  |  "
+                f"skip_if_exists={ci_skeleton.skip_if_exists}"
+            )
+
+    if lfs_enabled and not _LFS_AVAILABLE:
+        log.warning(
+            "migration.lfs_enabled is true but git-lfs is not installed or not on PATH. "
+            "LFS objects will NOT be migrated.  Install git-lfs and re-run, or set "
+            "lfs_enabled: false to suppress this warning."
+        )
 
     return MigrationConfig(
         auth=auth,
@@ -1332,6 +2542,13 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
         branch_include=branch_include,
         branch_exclude=branch_exclude,
         min_free_disk_gb=min_free_disk_gb,
+        git_http_post_buffer=int(mig.get("git_http_post_buffer_bytes", _DEFAULT_GIT_HTTP_POST_BUFFER)),
+        git_push_batch_size=int(mig.get("git_push_batch_size", _DEFAULT_PUSH_BATCH_SIZE)),
+        lfs_enabled=lfs_enabled,
+        detailed_commit_count=detailed_commit_count,
+        check_oversized_files=check_oversized_files,
+        ci_skeleton=ci_skeleton,
+        repo_custom_properties=_load_repo_properties_for_creation(config_path.parent),
         repos=repos,
     )
 
@@ -1341,6 +2558,7 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
 # ===========================================================================
 
 _shutdown_event = threading.Event()
+_disk_lock = threading.Lock()  # Serialises concurrent per-repo free-disk checks.
 
 
 def _handle_signal(signum: int, frame: object) -> None:
@@ -1390,24 +2608,162 @@ def _check_gitlab_connectivity(gitlab_url: str, gitlab_pat: str) -> None:
         raise RuntimeError(f"Cannot reach GitLab at {gitlab_url}: {exc}")
 
 
-def _check_disk_space(min_free_gb: float) -> None:
-    """Ensure sufficient free disk space in the system temp directory."""
+def _check_disk_space(min_free_gb: float, max_workers: int = 1) -> None:
+    """Ensure sufficient free disk space in the system temp directory.
+
+    The effective minimum is scaled by *max_workers* because every concurrent
+    worker may be cloning a repository up to min_free_disk_gb in size at the
+    same time.  Also checks free inode count on Linux/macOS.
+    """
     tmp = Path(tempfile.gettempdir())
     free_gb = shutil.disk_usage(tmp).free / (1024 ** 3)
-    if free_gb < min_free_gb:
-        raise RuntimeError(
+    effective_min_gb = min_free_gb * max(1, max_workers)
+    if free_gb < effective_min_gb:
+        log.warning(
             f"Insufficient disk space: {free_gb:.1f} GB free in {tmp}, "
-            f"need at least {min_free_gb:.1f} GB. "
-            "Free up space or lower migration.min_free_disk_gb in mirror-config.json."
+            f"need at least {effective_min_gb:.1f} GB "
+            f"({min_free_gb:.1f} GB \u00d7 {max_workers} concurrent worker(s)). "
+            "Free up space, lower migration.min_free_disk_gb, or reduce migration.max_workers. "
+            "Continuing anyway -- individual repos may fail if disk fills up."
+        )
+    # Check free inodes on Linux/macOS -- repos with many small files can exhaust
+    # inodes even when gigabytes of block space remain.
+    if sys.platform != "win32" and hasattr(os, "statvfs"):
+        try:
+            vfs = os.statvfs(tmp)
+            free_inodes = vfs.f_favail
+            _MIN_FREE_INODES = 100_000
+            if free_inodes < _MIN_FREE_INODES:
+                log.warning(
+                    f"Low inode count: {free_inodes:,} free in {tmp}, "
+                    f"need at least {_MIN_FREE_INODES:,}. "
+                    "Repositories with many small files may exhaust inodes "
+                    "independently of available disk space. Continuing anyway."
+                )
+        except OSError:
+            pass
+
+
+def _check_tmpfs() -> None:
+    """Warn if the system temp directory is on a tmpfs (RAM-backed) filesystem.
+
+    On many Linux distributions /tmp is a tmpfs mount backed by RAM + swap.
+    Cloning large repositories there consumes RAM, not disk, and can trigger
+    the OOM killer on migration servers.  This is a warning so operators can
+    decide whether to point TMPDIR at a disk-backed path.
+    """
+    if sys.platform == "win32":
+        return
+    tmp = str(Path(tempfile.gettempdir()).resolve())
+    fstype = ""
+
+    # Method 1: findmnt (util-linux, available on most Linux distros).
+    try:
+        result = subprocess.run(
+            ["findmnt", "--target", tmp, "--output", "FSTYPE", "--noheadings"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            fstype = result.stdout.strip().lower()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Method 2: /proc/mounts fallback (Linux-only).
+    if not fstype:
+        try:
+            mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+            best_prefix, best_fstype = "", ""
+            for line in mounts.splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    mount_point = parts[1]
+                    if tmp.startswith(mount_point) and len(mount_point) > len(best_prefix):
+                        best_prefix = mount_point
+                        best_fstype = parts[2]
+            fstype = best_fstype.lower()
+        except OSError:
+            pass
+
+    if "tmpfs" in fstype:
+        log.warning(
+            f"Temp directory ({tmp}) is on a tmpfs (RAM-backed) filesystem. "
+            "Cloning large repos here consumes RAM, not disk, and can trigger the OOM killer. "
+            "Set TMPDIR to a disk-backed path before running "
+            "(e.g. export TMPDIR=/var/migration-tmp && mkdir -p $TMPDIR)."
+        )
+
+
+def _check_file_descriptor_limit(max_workers: int) -> None:
+    """Warn if the open-file-descriptor limit is too low for concurrent git workers.
+
+    Each concurrent worker spawns a git subprocess plus helper processes
+    (git-remote-https, etc.), each consuming ~20 file descriptors.  The Linux
+    default of 1 024 is easily exhausted with 10+ concurrent workers.
+    """
+    if sys.platform == "win32":
+        return
+    try:
+        import resource
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        # 50 FDs per worker + 200 for the Python process and log handles.
+        recommended = max_workers * 50 + 200
+        if soft < recommended:
+            log.warning(
+                f"Open-file-descriptor limit (ulimit -n) is {soft}, "
+                f"but {recommended} is recommended for {max_workers} concurrent worker(s). "
+                "Low limits cause 'Too many open files' errors during migration. "
+                f"Run before starting:  ulimit -n {max(65535, recommended)}"
+            )
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def _check_gitlab_token_expiry(gitlab_url: str, gitlab_pat: str, warn_days: int = 7) -> None:
+    """Warn if the GitLab PAT expires soon or has already expired.
+
+    Uses GET /api/v4/personal_access_tokens/self (GitLab 14.10+).
+    Falls back silently when the endpoint is unavailable or the token has no expiry.
+    """
+    url = f"{gitlab_url.rstrip('/')}/api/v4/personal_access_tokens/self"
+    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": gitlab_pat})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return  # endpoint not supported or network error -- skip expiry check
+
+    expires_at = data.get("expires_at")  # "2026-06-01" or null
+    if not expires_at:
+        return  # token has no expiry date
+
+    try:
+        expiry = datetime.datetime.strptime(expires_at, "%Y-%m-%d").date()
+    except ValueError:
+        return
+
+    today = datetime.date.today()
+    days_left = (expiry - today).days
+    if days_left < 0:
+        raise RuntimeError(
+            f"GitLab PAT expired on {expires_at}. "
+            "Generate a new token: GitLab \u2192 User Settings \u2192 Access Tokens."
+        )
+    if days_left < warn_days:
+        log.warning(
+            f"GitLab PAT expires in {days_left} day(s) (on {expires_at}). "
+            "Renew it before the migration completes to avoid mid-run authentication failures."
         )
 
 
 def _preflight_checks(config: MigrationConfig, client: GitHubClient) -> None:
     """Run all pre-flight checks before any migration work begins."""
-    _check_disk_space(config.min_free_disk_gb)
+    _check_disk_space(config.min_free_disk_gb, config.max_workers)
+    _check_tmpfs()
+    _check_file_descriptor_limit(config.max_workers)
     _check_github_connectivity(client)
     if not config.dry_run:
         _check_gitlab_connectivity(config.gitlab_url, config.gitlab_pat)
+        _check_gitlab_token_expiry(config.gitlab_url, config.gitlab_pat)
 
 
 # ===========================================================================
@@ -1489,6 +2845,15 @@ def _write_reports(
                 "gh_tag_count": r.gh_tag_count,
                 "validation_status": r.validation_status,
                 "validation_notes": r.validation_notes,
+                "missing_branches": r.missing_branches,
+                "missing_tags": r.missing_tags,
+                "branch_sha_mismatches": r.branch_sha_mismatches,
+                "lfs_detected": r.lfs_detected,
+                "lfs_object_count": r.lfs_object_count,
+                "ci_skeleton_status": r.ci_skeleton_status,
+                "ci_skeleton_branches_created": r.ci_skeleton_branches_created,
+                "ci_skeleton_branches_skipped": r.ci_skeleton_branches_skipped,
+                "ci_skeleton_error": r.ci_skeleton_error,
                 "error": r.error,
                 "duration_seconds": round(r.duration_seconds, 1),
                 "duration_minutes": round(r.duration_seconds / 60, 2),
@@ -1502,8 +2867,16 @@ def _write_reports(
 
     # ---- XLSX / CSV ----------------------------------------------------
     if _XLSX_AVAILABLE:
-        _write_xlsx(results, report, config, elapsed_seconds, executed_by)
-        log.info(f"XLSX report : {_RESULTS_XLSX}")
+        try:
+            _write_xlsx(results, report, config, elapsed_seconds, executed_by)
+            log.info(f"XLSX report : {_RESULTS_XLSX}")
+        except Exception as xlsx_exc:
+            log.warning(
+                f"XLSX report generation failed ({xlsx_exc}) -- "
+                "writing CSV fallback instead"
+            )
+            _write_csv_fallback(results)
+            log.info(f"CSV report  : {_RESULTS_CSV}")
     else:
         _write_csv_fallback(results)
         log.info(f"CSV report  : {_RESULTS_CSV}")
@@ -1524,7 +2897,12 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
             "default_branch", "default_branch_renamed", "duration_min",
             "branch_count", "head_commit_sha", "tag_count",
             "gh_branch_count", "gh_head_commit_sha", "gh_tag_count",
-            "validation_status", "validation_notes", "error", "completed_at",
+            "validation_status", "validation_notes",
+            "missing_branches", "missing_tags", "branch_sha_mismatches",
+            "lfs_detected", "lfs_object_count",
+            "ci_skeleton_status", "ci_skeleton_branches_created",
+            "ci_skeleton_branches_skipped", "ci_skeleton_error",
+            "error", "completed_at",
         ])
         for r in results:
             writer.writerow([
@@ -1533,7 +2911,17 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
                 round(r.duration_seconds / 60, 3) if r.duration_seconds else "",
                 r.branch_count or "", r.head_commit_sha, r.tag_count or "",
                 r.gh_branch_count or "", r.gh_head_commit_sha, r.gh_tag_count or "",
-                r.validation_status, r.validation_notes, r.error, r.completed_at,
+                r.validation_status, r.validation_notes,
+                "; ".join(r.missing_branches) if r.missing_branches else "",
+                "; ".join(r.missing_tags) if r.missing_tags else "",
+                "; ".join(r.branch_sha_mismatches) if r.branch_sha_mismatches else "",
+                "Yes" if r.lfs_detected else "No",
+                r.lfs_object_count or "",
+                r.ci_skeleton_status,
+                "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
+                "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "",
+                r.ci_skeleton_error,
+                r.error, r.completed_at,
             ])
 
 
@@ -1691,10 +3079,18 @@ def _write_xlsx(
     _header_row(ws_repos, [
         "Source (GitLab)", "Target (GitHub)", "GitHub URL",
         "Status", "Visibility", "Default Branch", "Renamed to main",
-        "Branches Pushed", "Tags Pushed", "Duration (min)", "Completed At", "Error",
+        "Branches Pushed", "Tags Pushed", "LFS Detected", "LFS Objects",
+        "Duration (min)", "Completed At", "Error",
+        "CI Skeleton", "CI Branches Created", "CI Branches Skipped", "CI Error",
     ])
     for ri, r in enumerate(results, 2):
         rf = STATUS_FILLS.get(r.status, _fill("FFFFFF"))
+        ci_fill = (
+            _fill("C6EFCE") if r.ci_skeleton_status == "created" else
+            _fill("FFEB9C") if r.ci_skeleton_status in ("partial", "skipped_all") else
+            _fill("FFC7CE") if r.ci_skeleton_status == "failed" else
+            rf
+        )
         vals = [
             r.source, r.target, None,
             r.status,
@@ -1703,10 +3099,18 @@ def _write_xlsx(
             "Yes" if r.default_branch_renamed else ("No" if r.status == "succeeded" else ""),
             r.branch_count or "",
             r.tag_count or "",
+            "Yes" if r.lfs_detected else ("No" if r.status == "succeeded" else ""),
+            r.lfs_object_count if r.lfs_detected else "",
             round(r.duration_seconds / 60, 2) if r.duration_seconds else "",
             r.completed_at,
             r.error,
+            r.ci_skeleton_status or "",
+            "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
+            "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "",
+            r.ci_skeleton_error,
         ]
+        # Columns that should wrap: Error(14), CI Error(18)
+        _wrap_cols_repos = {14, 18}
         for ci, val in enumerate(vals, 1):
             if ci == 3:
                 if r.gh_repo_url:
@@ -1714,9 +3118,9 @@ def _write_xlsx(
                     ws_repos.cell(ri, ci).fill = rf
                 continue
             c = ws_repos.cell(row=ri, column=ci, value=val)
-            c.fill = rf
-            c.alignment = WRAP if ci == 12 else LEFT
-    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 16, 12, 14, 22, 45])
+            c.fill = ci_fill if ci >= 15 else rf
+            c.alignment = WRAP if ci in _wrap_cols_repos else LEFT
+    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 16, 12, 12, 12, 14, 22, 45, 14, 30, 30, 40])
 
     # =========================================================================
     # Sheet 3: Failed & Mismatches (engineers -- actionable only)
@@ -1754,10 +3158,10 @@ def _write_xlsx(
         "Source (GitLab)", "Target (GitHub)", "GitHub URL", "Migration Status",
         "Src Branches", "GH Branches", "Branches \u2713/\u2717",
         "Src Tags", "GH Tags", "Tags \u2713/\u2717",
-        "Src Commits", "GH Commits", "Commits \u2713/\u2717",
         "Src HEAD (10)", "GH HEAD (10)", "HEAD \u2713/\u2717",
         "Default Branch", "Renamed to main",
         "Validation Status", "Validation Notes",
+        "Missing Branches", "Missing Tags", "Branch SHA Mismatches",
     ])
     for ri, r in enumerate(
         (r for r in results if r.status not in ("skipped", "dry-run")), 2
@@ -1772,9 +3176,6 @@ def _write_xlsx(
             r.tag_count or "",
             r.gh_tag_count or "",
             _match_icon(r.tag_count, r.gh_tag_count),
-            r.commit_count or "",
-            r.gh_commit_count or "",
-            _match_icon(r.commit_count, r.gh_commit_count),
             r.head_commit_sha[:10] if r.head_commit_sha else "",
             r.gh_head_commit_sha[:10] if r.gh_head_commit_sha else "",
             _match_icon(r.head_commit_sha, r.gh_head_commit_sha),
@@ -1782,7 +3183,13 @@ def _write_xlsx(
             "Yes" if r.default_branch_renamed else "No",
             r.validation_status,
             r.validation_notes,
+            "; ".join(r.missing_branches) if r.missing_branches else "",
+            "; ".join(r.missing_tags) if r.missing_tags else "",
+            "; ".join(r.branch_sha_mismatches) if r.branch_sha_mismatches else "",
         ]
+        # Column indices that should wrap: notes(17), missing_branches(18),
+        # missing_tags(19), branch_sha_mismatches(20)
+        _wrap_cols = {17, 18, 19, 20}
         for ci, val in enumerate(vals, 1):
             if ci == 3:
                 if r.gh_repo_url:
@@ -1791,8 +3198,8 @@ def _write_xlsx(
                 continue
             c = ws_val.cell(row=ri, column=ci, value=val)
             c.fill = rf
-            c.alignment = WRAP if ci == 20 else LEFT
-    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 14, 14, 14, 18, 16, 18, 50])
+            c.alignment = WRAP if ci in _wrap_cols else LEFT
+    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 18, 16, 18, 50, 45, 45, 55])
 
     # =========================================================================
     # Sheet 5: Run Metrics (internal ops -- not for client)
@@ -1821,6 +3228,15 @@ def _write_xlsx(
     _met_row("Push Timeout",       f"{config.push_timeout}s")
     _met_row("Git Retries",        str(config.git_max_retries))
     _met_row("Min Free Disk",      f"{config.min_free_disk_gb} GB")
+    _met_row("LFS Enabled",        str(config.lfs_enabled))
+    _met_row("LFS Available",      "Yes" if _LFS_AVAILABLE else "No (git-lfs not installed)")
+    _met_row("CI Skeleton",        "Enabled" if (config.ci_skeleton and config.ci_skeleton.enabled) else "Disabled")
+    if config.ci_skeleton and config.ci_skeleton.enabled:
+        _met_row("  Templates Dir",  str(config.ci_skeleton.templates_dir.name))
+        _met_row("  Target Path",    config.ci_skeleton.target_path)
+        _met_row("  Branches",       ", ".join(config.ci_skeleton.branches))
+        _met_row("  Skip If Exists", str(config.ci_skeleton.skip_if_exists))
+    _met_row("Detailed Commit Count", str(config.detailed_commit_count))
     _met_row("Dry Run",            str(config.dry_run))
     _met_row("Rename to main",     str(config.rename_default_branch))
     _met_row("", "")
@@ -1830,6 +3246,46 @@ def _write_xlsx(
         _met_row("Min per Repo",   f"{m.get('min_seconds', 0)}s")
         _met_row("Max per Repo",   f"{m.get('max_seconds', 0)}s")
         _met_row("Mean per Repo",  f"{m.get('mean_seconds', 0)}s")
+
+    # =========================================================================
+    # Sheet 6: CI Skeleton Results
+    # =========================================================================
+    ws_ci = wb.create_sheet("CI Skeleton")
+    _header_row(ws_ci, [
+        "Target (GitHub)", "GitHub URL", "Template File",
+        "CI Status", "Branches Created", "Branches Skipped (exists)", "Error",
+    ])
+    CI_STATUS_FILLS = {
+        "created":     _fill("C6EFCE"),
+        "partial":     _fill("FFEB9C"),
+        "skipped_all": _fill("F2F2F2"),
+        "failed":      _fill("FFC7CE"),
+        "dry-run":     _fill("FFEB9C"),
+        "not_configured": _fill("F2F2F2"),
+    }
+    ci_rows = [r for r in results if r.status not in ("skipped",)]
+    for ri, r in enumerate(ci_rows, 2):
+        rf = CI_STATUS_FILLS.get(r.ci_skeleton_status, _fill("FFFFFF"))
+        ci_vals = [
+            r.target, None,
+            "",   # template filename -- enriched below if available
+            r.ci_skeleton_status or "not_configured",
+            "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "\u2014",
+            "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "\u2014",
+            r.ci_skeleton_error or "",
+        ]
+        for ci, val in enumerate(ci_vals, 1):
+            if ci == 2:
+                if r.gh_repo_url:
+                    _hyperlink_cell(ws_ci, ri, ci, r.gh_repo_url, r.gh_repo_url)
+                    ws_ci.cell(ri, ci).fill = rf
+                continue
+            c = ws_ci.cell(row=ri, column=ci, value=val)
+            c.fill = rf
+            c.alignment = WRAP if ci in (5, 6, 7) else LEFT
+    _col_widths(ws_ci, [45, 52, 22, 16, 40, 40, 45])
+    if not ci_rows:
+        ws_ci.cell(row=2, column=1, value="\u2139\ufe0f  CI skeleton was not enabled during this run.")
 
     wb.save(str(_RESULTS_XLSX))
 
@@ -1855,6 +3311,17 @@ def _migrate_one(
         status = "succeeded" if mr.ok else "failed"
         state.record(key, status)
 
+    # Post-push: CI skeleton creation (failures recorded but don't affect migration status).
+    ci_result = _CiSkeletonResult(status="not_configured")
+    if config.ci_skeleton and config.ci_skeleton.enabled:
+        if config.dry_run or mr.ok:
+            ci_result = _create_ci_skeleton(spec, config, client, mr.default_branch)
+            if ci_result.status not in ("not_configured", "dry-run", "created", "skipped_all"):
+                log.warning(
+                    f"[{spec.target_name}] CI skeleton status: {ci_result.status}"
+                    + (f" | {ci_result.error}" if ci_result.error else "")
+                )
+
     return _RepoResult(
         source=key,
         target=f"{spec.target_org}/{spec.target_name}",
@@ -1876,6 +3343,15 @@ def _migrate_one(
         default_branch_renamed=mr.default_branch_renamed,
         validation_status=mr.validation_status,
         validation_notes=mr.validation_notes,
+        missing_branches=mr.missing_branches,
+        missing_tags=mr.missing_tags,
+        branch_sha_mismatches=mr.branch_sha_mismatches,
+        lfs_detected=mr.lfs_detected,
+        lfs_object_count=mr.lfs_object_count,
+        ci_skeleton_status=ci_result.status,
+        ci_skeleton_branches_created=ci_result.branches_created,
+        ci_skeleton_branches_skipped=ci_result.branches_skipped,
+        ci_skeleton_error=ci_result.error,
     )
 
 
@@ -2054,7 +3530,7 @@ def _print_migration_preview(
 # Orchestration
 # ===========================================================================
 
-def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path) -> None:
+def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path, batch_size: int = 0) -> None:
     """Migrate all repos concurrently with checkpoint, rate limiting, and graceful shutdown."""
     if shutil.which("git") is None:
         raise RuntimeError(
@@ -2080,6 +3556,13 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
     for spec in config.repos:
         key = f"{spec.namespace}/{spec.project}"
         (already_done if state.is_succeeded(key) else pending).append(spec)
+
+    if batch_size > 0 and len(pending) > batch_size:
+        log.info(
+            f"Batch mode: capping this run at {batch_size} repo(s) "
+            f"({len(pending) - batch_size} remaining will be processed in future runs)."
+        )
+        pending = pending[:batch_size]
 
     skipped_results: list[_RepoResult] = [
         _RepoResult(
@@ -2186,16 +3669,292 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
 
 
 # ===========================================================================
+# Post-migration: apply GitHub custom repository properties
+# ===========================================================================
+
+_REPO_PROPERTIES_CSV_FILENAME = "repo-properties.csv"
+
+
+def _load_repo_properties_csv(csv_path: Path) -> dict[str, dict[str, str]]:
+    """Read repo-properties.csv and return a mapping of 'org/repo' -> {prop: val}.
+
+    Expected CSV format (header row required):
+        target_org,target_name,<property1>,<property2>,...
+
+    Rows where both target_org and target_name are non-blank are included.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Repo properties CSV not found: {csv_path}\n"
+            "Create it with columns: target_org,target_name,<prop1>,<prop2>,..."
+        )
+
+    result: dict[str, dict[str, str]] = {}
+    with csv_path.open(encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"repo-properties.csv appears to be empty: {csv_path}")
+        required = {"target_org", "target_name"}
+        missing_cols = required - {c.strip() for c in reader.fieldnames if c}
+        if missing_cols:
+            raise ValueError(
+                f"repo-properties.csv is missing required columns: {sorted(missing_cols)}"
+            )
+        prop_cols = [
+            c.strip() for c in reader.fieldnames
+            if c and c.strip() not in ("target_org", "target_name")
+        ]
+        if not prop_cols:
+            raise ValueError(
+                "repo-properties.csv has no property columns besides target_org/target_name."
+            )
+        for lineno, row in enumerate(reader, 2):
+            org = (row.get("target_org") or "").strip()
+            name = (row.get("target_name") or "").strip()
+            if not org or not name:
+                log.debug(f"repo-properties.csv line {lineno}: skipping blank org/name")
+                continue
+            key = f"{org}/{name}"
+            props = {p: (row.get(p) or "").strip() for p in prop_cols}
+            # Drop empty values -- omit properties that have no value so we
+            # don't accidentally clear existing values with an empty string.
+            props = {k: v for k, v in props.items() if v}
+            if props:
+                result[key] = props
+    return result
+
+
+def _validate_org_property_schema(
+    client: GitHubClient,
+    org: str,
+    property_names: set[str],
+) -> list[str]:
+    """Return property names not defined in the org schema, or [] if validation cannot run."""
+    try:
+        status, body = client.request("GET", f"/orgs/{org}/properties/schema")
+        if status == 403:
+            log.warning(
+                f"[post-migration] Insufficient permissions to read org property schema "
+                f"for '{org}' (HTTP 403). Skipping validation -- GitHub will reject unknown names."
+            )
+            return []
+        if status != 200:
+            log.warning(
+                f"[post-migration] Could not fetch property schema for org '{org}' "
+                f"(HTTP {status}). Skipping validation."
+            )
+            return []
+        schema: list[dict] = body if isinstance(body, list) else []
+        defined = {entry["property_name"] for entry in schema if "property_name" in entry}
+        return sorted(property_names - defined)
+    except Exception as exc:
+        log.warning(f"[post-migration] Schema validation request failed: {exc}. Continuing.")
+        return []
+
+
+def _set_repo_properties(
+    client: GitHubClient,
+    org: str,
+    repo: str,
+    properties: dict[str, str],
+    label: str,
+) -> tuple[bool, str]:
+    """PATCH /repos/{org}/{repo}/properties/values. Returns (ok, error_message)."""
+    if not properties:
+        return True, ""
+    payload = {
+        "properties": [
+            {"property_name": k, "value": v}
+            for k, v in properties.items()
+        ]
+    }
+    try:
+        status, body = client.request("PATCH", f"/repos/{org}/{repo}/properties/values", body=payload)
+        if status in (200, 204):
+            log.info(
+                f"[{label}] Custom properties set: "
+                + ", ".join(f"{k}={v!r}" for k, v in properties.items())
+            )
+            return True, ""
+        err = f"HTTP {status}: {body.get('message', str(body))[:200]}"
+        log.warning(f"[{label}] Failed to set custom properties -- {err}")
+        return False, err
+    except Exception as exc:
+        err = str(exc)
+        log.warning(f"[{label}] Exception setting custom properties -- {err}")
+        return False, err
+
+
+def run_post_migration(
+    config: MigrationConfig,
+    config_path: Path,
+    repos_csv_path: Path,
+    properties_csv_path: Path,
+) -> None:
+    """Apply GitHub custom repository properties to previously migrated repos.
+
+    Reads the checkpoint file to find repos with 'succeeded' status, then
+    applies custom properties from *properties_csv_path* for each matched repo.
+    A separate post-migration report (JSON) is written when complete.
+    """
+    log.info("=" * 60)
+    log.info("POST-MIGRATION: Applying custom repository properties")
+    log.info("=" * 60)
+
+    # ---- Load properties CSV -------------------------------------------
+    try:
+        props_map = _load_repo_properties_csv(properties_csv_path)
+    except (FileNotFoundError, ValueError) as exc:
+        log.error(f"[post-migration] Cannot load properties CSV: {exc}")
+        sys.exit(1)
+
+    if not props_map:
+        log.warning("[post-migration] repo-properties.csv has no usable rows. Nothing to do.")
+        return
+
+    log.info(f"[post-migration] Loaded {len(props_map)} repo property mappings from {properties_csv_path.name}")
+
+    # ---- Validate property names against org schema --------------------
+    client = GitHubClient(
+        auth=config.auth,
+        api_base=config.github_api_url,
+        max_retries=_DEFAULT_API_RETRIES,
+    )
+
+    # Collect all orgs referenced in the CSV
+    orgs_in_csv: set[str] = {key.split("/", 1)[0] for key in props_map}
+    all_prop_names: set[str] = set()
+    for props in props_map.values():
+        all_prop_names.update(props.keys())
+
+    for org in sorted(orgs_in_csv):
+        undefined = _validate_org_property_schema(client, org, all_prop_names)
+        if undefined:
+            log.warning(
+                f"[post-migration] Org '{org}': the following property names are NOT defined "
+                f"in the schema -- {undefined}. Requests for these will likely return HTTP 422. "
+                "Define them in GitHub → Org Settings → Custom Properties before proceeding."
+            )
+
+    # ---- Load checkpoint to find succeeded repos -----------------------
+    state = MigrationState(_CHECKPOINT_FILE)
+    succeeded_keys = {k for k, v in state._state.items() if v == "succeeded"}
+
+    if not succeeded_keys:
+        log.warning("[post-migration] No repos with 'succeeded' status in checkpoint. Nothing to do.")
+        return
+
+    log.info(f"[post-migration] {len(succeeded_keys)} succeeded repo(s) in checkpoint")
+
+    # ---- Apply properties ----------------------------------------------
+    applied: list[dict] = []
+    skipped: list[dict] = []
+    failed: list[dict] = []
+    t_start = time.monotonic()
+
+    for key in sorted(succeeded_keys):
+        # key format: "namespace/project"
+        # We need the target org/name -- read from repos.csv mapping via config
+        spec = next(
+            (r for r in config.repos if f"{r.namespace}/{r.project}" == key),
+            None,
+        )
+        if spec is None:
+            log.debug(f"[post-migration] No RepoSpec for checkpoint key '{key}' -- skipping")
+            skipped.append({"source": key, "target": "", "reason": "not in repos.csv"})
+            continue
+
+        target_key = f"{spec.target_org}/{spec.target_name}"
+        props = props_map.get(target_key)
+        if not props:
+            log.debug(f"[post-migration] No properties defined for '{target_key}' -- skipping")
+            skipped.append({"source": key, "target": target_key, "reason": "not in repo-properties.csv"})
+            continue
+
+        ok, err = _set_repo_properties(client, spec.target_org, spec.target_name, props, target_key)
+        if ok:
+            applied.append({"source": key, "target": target_key, "properties": props})
+        else:
+            failed.append({"source": key, "target": target_key, "properties": props, "error": err})
+
+    elapsed = time.monotonic() - t_start
+
+    # ---- Summary -------------------------------------------------------
+    log.info("=" * 60)
+    log.info(f"[post-migration] Applied : {len(applied)} repo(s)")
+    log.info(f"[post-migration] Skipped : {len(skipped)} repo(s) (no properties configured)")
+    log.info(f"[post-migration] Failed  : {len(failed)} repo(s)")
+    log.info(f"[post-migration] Elapsed : {_fmt_duration(elapsed)}")
+    log.info("=" * 60)
+
+    # ---- Write post-migration report -----------------------------------
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = _SCRIPT_DIR / "reports" / f"post-migration-properties-{ts}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_data = {
+        "run_type": "post_migration_properties",
+        "completed_at": _fmt_ts(),
+        "elapsed_seconds": round(elapsed, 1),
+        "summary": {
+            "applied": len(applied),
+            "skipped": len(skipped),
+            "failed": len(failed),
+        },
+        "applied": applied,
+        "skipped": skipped,
+        "failed": failed,
+    }
+    report_path.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+    log.info(f"[post-migration] Report written: {report_path}")
+
+    if failed:
+        log.warning(
+            f"[post-migration] {len(failed)} repo(s) failed. "
+            f"Review {report_path.name} and retry."
+        )
+        sys.exit(1)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
 if __name__ == "__main__":
+    import argparse as _argparse
+
+    _parser = _argparse.ArgumentParser(
+        description="GitLab \u2192 GitHub Mirror Migration",
+        formatter_class=_argparse.RawDescriptionHelpFormatter,
+    )
+    _parser.add_argument(
+        "--batch", type=int, default=0, metavar="N",
+        help=(
+            "Process at most N pending repositories in this run "
+            "(0 = all pending). Use this to control blast radius "
+            "when migrating in multiple runs (e.g. --batch 500)."
+        ),
+    )
+    _parser.add_argument(
+        "--post-migration", action="store_true",
+        help=(
+            "Run post-migration step: apply GitHub custom repository properties "
+            "from repo-properties.csv to all previously succeeded repos. "
+            "Does NOT re-run the migration."
+        ),
+    )
+    _args = _parser.parse_args()
+
     config_path = _SCRIPT_DIR / _CONFIG_FILENAME
     repos_csv_path = _SCRIPT_DIR / _REPOS_CSV_FILENAME
+    properties_csv_path = _SCRIPT_DIR / _REPO_PROPERTIES_CSV_FILENAME
 
     try:
         migration_config = load_config(config_path, repos_csv_path)
-        migrate_all(migration_config, config_path, repos_csv_path)
+
+        if _args.post_migration:
+            run_post_migration(migration_config, config_path, repos_csv_path, properties_csv_path)
+        else:
+            migrate_all(migration_config, config_path, repos_csv_path, batch_size=_args.batch)
 
     except _MissingConfigError as exc:
         log.warning(str(exc))
