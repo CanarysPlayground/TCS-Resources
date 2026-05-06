@@ -786,6 +786,7 @@ class MigrationConfig:
     # {org: {prop_name: value_type}}; fetched once per org in migrate_all, not from JSON
     _org_property_schemas: dict[str, dict[str, str]] = field(default_factory=dict, repr=False, compare=False)
     repos: list[RepoSpec] = field(default_factory=list)
+    notification: "EmailConfig | None" = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -2900,7 +2901,56 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
         ci_skeleton=ci_skeleton,
         repo_custom_properties=_load_repo_properties_for_creation(config_path.parent),
         repos=repos,
+        notification=_parse_email_config(raw.get("notification", {})),
     )
+
+
+def _parse_email_config(notif: dict) -> "EmailConfig | None":
+    """Build an EmailConfig from the 'notification' block of mirror-config.json.
+
+    Returns None when the block is absent or 'enabled' is false so callers can
+    treat a missing config and a disabled config identically.
+    """
+    if not notif or not notif.get("enabled", False):
+        return None
+
+    smtp_port = int(notif.get("smtp_port", 587))
+    # Auto-detect TLS mode from port when not explicitly set.
+    use_ssl  = bool(notif.get("use_ssl",  smtp_port == 465))
+    use_tls  = bool(notif.get("use_tls",  smtp_port == 587 and not use_ssl))
+
+    to_raw = notif.get("to", [])
+    to_list = [a.strip() for a in (to_raw if isinstance(to_raw, list) else to_raw.split(",")) if a.strip()]
+    cc_raw = notif.get("cc", [])
+    cc_list = [a.strip() for a in (cc_raw if isinstance(cc_raw, list) else cc_raw.split(",")) if a.strip()]
+
+    if not to_list:
+        log.warning("[email] notification.to is empty -- email notifications disabled")
+        return None
+
+    cfg = EmailConfig(
+        enabled=True,
+        smtp_host=notif["smtp_host"],
+        smtp_port=smtp_port,
+        smtp_user=notif.get("smtp_user", ""),
+        smtp_password=notif.get("smtp_password", ""),
+        use_tls=use_tls,
+        use_ssl=use_ssl,
+        from_address=notif.get("from", ""),
+        to_addresses=to_list,
+        cc_addresses=cc_list,
+        subject_prefix=notif.get("subject_prefix", "[GitMigration]"),
+        attach_report=bool(notif.get("attach_report", True)),
+        attach_log_tail_lines=int(notif.get("attach_log_tail_lines", 200)),
+        timeout=int(notif.get("smtp_timeout_seconds", 30)),
+    )
+    log.info(
+        f"[email] Notifications enabled  |  "
+        f"smtp={cfg.smtp_host}:{cfg.smtp_port}  |  "
+        f"mode={'SSL' if cfg.use_ssl else 'STARTTLS' if cfg.use_tls else 'plain'}  |  "
+        f"to={cfg.to_addresses}"
+    )
+    return cfg
 
 
 # ===========================================================================
@@ -3138,6 +3188,263 @@ def _compute_metrics(results: list[_RepoResult]) -> dict:
 
 
 # ===========================================================================
+# Email notification
+# ===========================================================================
+
+@dataclass
+class EmailConfig:
+    """SMTP notification settings loaded from the 'notification' block in mirror-config.json."""
+    enabled: bool
+    smtp_host: str
+    smtp_port: int                    # 465=SSL, 587=STARTTLS, 25=plain
+    smtp_user: str
+    smtp_password: str = field(repr=False)
+    use_tls: bool = True              # STARTTLS on port 587 (recommended)
+    use_ssl: bool = False             # Implicit SSL on port 465
+    from_address: str = ""
+    to_addresses: list[str] = field(default_factory=list)
+    cc_addresses: list[str] = field(default_factory=list)
+    subject_prefix: str = "[GitMigration]"
+    attach_report: bool = True        # attach the XLSX/CSV report
+    attach_log_tail_lines: int = 200  # last N lines of the log attached as .txt
+    timeout: int = 30                 # SMTP connection timeout seconds
+
+
+def _send_migration_email(
+    cfg: EmailConfig,
+    results: list[_RepoResult],
+    run_started: str,
+    elapsed_seconds: float,
+    executed_by: str,
+    report_path: Path | None,
+    log_path: Path,
+) -> None:
+    """Compose and send a migration-complete notification via SMTP.
+
+    Uses stdlib only (smtplib + email.mime).  Sends a multipart/alternative
+    HTML + plain-text message with the XLSX/CSV report and a log tail attached.
+    Any exception is caught and logged as a WARNING so a mail failure never
+    aborts or marks the migration as failed.
+    """
+    import smtplib
+    import email.mime.multipart
+    import email.mime.text
+    import email.mime.base
+    import email.mime.application
+    import email.encoders
+    import email.utils
+
+    if not cfg.enabled or not cfg.to_addresses:
+        return
+
+    succeeded = [r for r in results if r.status == "succeeded"]
+    partial   = [r for r in results if r.status == "partial"]
+    failed    = [r for r in results if r.status == "failed"]
+    skipped   = [r for r in results if r.status == "skipped"]
+    processed = len(succeeded) + len(partial) + len(failed)
+    success_rate = (
+        f"{len(succeeded)/processed*100:.1f}%" if processed else "N/A"
+    )
+
+    # Overall run outcome for subject line
+    if failed:
+        outcome = "FAILED"
+    elif partial:
+        outcome = "PARTIAL"
+    else:
+        outcome = "SUCCEEDED"
+
+    subject = (
+        f"{cfg.subject_prefix} Migration {outcome} "
+        f"-- {len(succeeded)}/{processed} repos "
+        f"| {run_started}"
+    )
+
+    # ---- failed / partial repo tables for HTML body ----
+    def _repo_rows(repo_list: list[_RepoResult], color: str) -> str:
+        if not repo_list:
+            return ""
+        rows = "".join(
+            f"<tr><td style='padding:4px 8px;border:1px solid #ddd'>{r.target}</td>"
+            f"<td style='padding:4px 8px;border:1px solid #ddd;color:{color}'>"
+            f"{r.status}</td>"
+            f"<td style='padding:4px 8px;border:1px solid #ddd;font-size:12px'>"
+            f"{(r.error or r.custom_properties_error or r.ci_skeleton_error)[:120]}</td></tr>"
+            for r in repo_list
+        )
+        return rows
+
+    failed_rows  = _repo_rows(failed,  "#c0392b")
+    partial_rows = _repo_rows(partial, "#e67e22")
+    detail_table = ""
+    if failed_rows or partial_rows:
+        detail_table = f"""
+<h3 style='color:#c0392b'>Repositories Requiring Attention</h3>
+<table style='border-collapse:collapse;width:100%;font-family:monospace;font-size:13px'>
+  <thead>
+    <tr style='background:#f2f2f2'>
+      <th style='padding:4px 8px;border:1px solid #ddd;text-align:left'>Repository</th>
+      <th style='padding:4px 8px;border:1px solid #ddd;text-align:left'>Status</th>
+      <th style='padding:4px 8px;border:1px solid #ddd;text-align:left'>Error (truncated)</th>
+    </tr>
+  </thead>
+  <tbody>{failed_rows}{partial_rows}</tbody>
+</table>"""
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'></head>
+<body style='font-family:Arial,Helvetica,sans-serif;color:#333;max-width:800px'>
+<h2 style='border-bottom:2px solid #2c3e50;padding-bottom:6px'>
+  GitLab &#8594; GitHub Migration Run Complete
+</h2>
+<table style='border-collapse:collapse;width:100%;margin-bottom:16px'>
+  <tbody>
+    <tr><td style='padding:4px 12px;font-weight:bold;width:200px'>Run Started</td>
+        <td style='padding:4px 12px'>{run_started}</td></tr>
+    <tr style='background:#f9f9f9'>
+        <td style='padding:4px 12px;font-weight:bold'>Executed By</td>
+        <td style='padding:4px 12px'>{executed_by or 'N/A'}</td></tr>
+    <tr><td style='padding:4px 12px;font-weight:bold'>Elapsed</td>
+        <td style='padding:4px 12px'>{_fmt_duration(elapsed_seconds)}</td></tr>
+    <tr style='background:#f9f9f9'>
+        <td style='padding:4px 12px;font-weight:bold'>Outcome</td>
+        <td style='padding:4px 12px;font-weight:bold;color:{"#27ae60" if outcome=="SUCCEEDED" else "#c0392b" if outcome=="FAILED" else "#e67e22"}'>
+          {outcome}</td></tr>
+  </tbody>
+</table>
+<h3 style='color:#2c3e50'>Summary</h3>
+<table style='border-collapse:collapse;font-size:14px'>
+  <tbody>
+    <tr><td style='padding:3px 12px'>&#9989; Succeeded</td>
+        <td style='padding:3px 12px;font-weight:bold;color:#27ae60'>{len(succeeded)}</td></tr>
+    <tr><td style='padding:3px 12px'>&#9888; Partial</td>
+        <td style='padding:3px 12px;font-weight:bold;color:#e67e22'>{len(partial)}</td></tr>
+    <tr><td style='padding:3px 12px'>&#10060; Failed</td>
+        <td style='padding:3px 12px;font-weight:bold;color:#c0392b'>{len(failed)}</td></tr>
+    <tr><td style='padding:3px 12px'>&#9193; Skipped</td>
+        <td style='padding:3px 12px'>{len(skipped)}</td></tr>
+    <tr><td style='padding:3px 12px'>&#128202; Success Rate</td>
+        <td style='padding:3px 12px;font-weight:bold'>{success_rate}</td></tr>
+  </tbody>
+</table>
+{detail_table}
+<p style='margin-top:20px;font-size:12px;color:#888'>
+  Full details are attached as a report file and log excerpt.
+  Re-run the migration script to automatically retry any failed or partial repositories.
+</p>
+</body></html>"""
+
+    # Plain-text fallback
+    plain_body = (
+        f"GitLab -> GitHub Migration Run Complete\n"
+        f"{'='*50}\n"
+        f"Run Started  : {run_started}\n"
+        f"Executed By  : {executed_by or 'N/A'}\n"
+        f"Elapsed      : {_fmt_duration(elapsed_seconds)}\n"
+        f"Outcome      : {outcome}\n\n"
+        f"Summary\n"
+        f"-------\n"
+        f"  Succeeded   : {len(succeeded)}\n"
+        f"  Partial     : {len(partial)}\n"
+        f"  Failed      : {len(failed)}\n"
+        f"  Skipped     : {len(skipped)}\n"
+        f"  Success Rate: {success_rate}\n\n"
+    )
+    if failed or partial:
+        plain_body += "Repositories requiring attention:\n"
+        for r in failed + partial:
+            err = r.error or r.custom_properties_error or r.ci_skeleton_error
+            plain_body += f"  [{r.status.upper()}] {r.target}  -- {err[:120]}\n"
+
+    # ---- assemble MIME message ----
+    msg = email.mime.multipart.MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["From"]    = email.utils.formataddr(("GitMigration Bot", cfg.from_address or cfg.smtp_user))
+    msg["To"]      = ", ".join(cfg.to_addresses)
+    if cfg.cc_addresses:
+        msg["Cc"]  = ", ".join(cfg.cc_addresses)
+    msg["Date"]    = email.utils.formatdate(localtime=True)
+    msg["X-Mailer"] = "GitMirrorMigration"
+
+    # multipart/alternative for HTML + plain
+    alt = email.mime.multipart.MIMEMultipart("alternative")
+    alt.attach(email.mime.text.MIMEText(plain_body, "plain", "utf-8"))
+    alt.attach(email.mime.text.MIMEText(html_body,  "html",  "utf-8"))
+    msg.attach(alt)
+
+    # Attach XLSX or CSV report
+    if cfg.attach_report and report_path and report_path.exists():
+        try:
+            report_data = report_path.read_bytes()
+            mime_type = (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                if report_path.suffix == ".xlsx" else "text/csv"
+            )
+            att = email.mime.base.MIMEBase(*mime_type.split("/", 1))
+            att.set_payload(report_data)
+            email.encoders.encode_base64(att)
+            att.add_header(
+                "Content-Disposition", "attachment",
+                filename=report_path.name,
+            )
+            msg.attach(att)
+        except Exception as att_exc:
+            log.warning(f"[email] Could not attach report: {att_exc}")
+
+    # Attach log tail
+    if cfg.attach_log_tail_lines > 0 and log_path.exists():
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail  = "\n".join(lines[-cfg.attach_log_tail_lines:])
+            log_att = email.mime.text.MIMEText(tail, "plain", "utf-8")
+            log_att.add_header(
+                "Content-Disposition", "attachment",
+                filename=f"migration-log-tail-{run_started.replace(' ', '_').replace(':', '-')}.txt",
+            )
+            msg.attach(log_att)
+        except Exception as log_exc:
+            log.warning(f"[email] Could not attach log tail: {log_exc}")
+
+    # ---- SMTP send ----
+    all_recipients = cfg.to_addresses + cfg.cc_addresses
+    try:
+        if cfg.use_ssl:
+            # Implicit TLS (port 465)
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout, context=ctx) as srv:
+                if cfg.smtp_user and cfg.smtp_password:
+                    srv.login(cfg.smtp_user, cfg.smtp_password)
+                srv.sendmail(cfg.smtp_user, all_recipients, msg.as_bytes())
+        elif cfg.use_tls:
+            # STARTTLS (port 587)
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout) as srv:
+                srv.ehlo()
+                srv.starttls(context=ctx)
+                srv.ehlo()
+                if cfg.smtp_user and cfg.smtp_password:
+                    srv.login(cfg.smtp_user, cfg.smtp_password)
+                srv.sendmail(cfg.smtp_user, all_recipients, msg.as_bytes())
+        else:
+            # Plain SMTP (port 25, no encryption -- internal relay only)
+            with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout) as srv:
+                srv.ehlo()
+                if cfg.smtp_user and cfg.smtp_password:
+                    srv.login(cfg.smtp_user, cfg.smtp_password)
+                srv.sendmail(cfg.smtp_user, all_recipients, msg.as_bytes())
+
+        log.info(
+            f"[email] Notification sent to {', '.join(cfg.to_addresses)} "
+            f"(subject: {subject!r})"
+        )
+    except Exception as exc:
+        log.warning(f"[email] Failed to send notification: {exc}")
+
+
+# ===========================================================================
 # Report writing
 # ===========================================================================
 
@@ -3241,6 +3548,21 @@ def _write_reports(
         )
 
     log.info(f"Log file    : {_LOG_FILE}")
+
+    # ---- Email notification ----------------------------------------
+    if config.notification and config.notification.enabled:
+        _report_path = _RESULTS_XLSX if _XLSX_AVAILABLE and _RESULTS_XLSX.exists() else (
+            _RESULTS_CSV if _RESULTS_CSV.exists() else None
+        )
+        _send_migration_email(
+            cfg=config.notification,
+            results=results,
+            run_started=run_started,
+            elapsed_seconds=elapsed_seconds,
+            executed_by=executed_by,
+            report_path=_report_path,
+            log_path=_LOG_FILE,
+        )
 
 
 def _write_csv_fallback(results: list[_RepoResult]) -> None:
