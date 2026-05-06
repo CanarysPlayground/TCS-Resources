@@ -666,7 +666,10 @@ class MigrationConfig:
     detailed_commit_count: bool = False                # count commits via rev-list (slow on large repos)
     check_oversized_files: bool = True                 # scan for blobs > 100 MB before pushing (GitHub hard limit)
     ci_skeleton: CiSkeletonConfig | None = None        # CI skeleton creation config; None = disabled
-    repo_custom_properties: dict[str, dict[str, str]] = field(default_factory=dict)  # "org/repo" -> {prop: val}; injected at repo creation
+    # "org/repo" -> {prop: raw_csv_val}; raw strings loaded from repo-properties.csv
+    repo_custom_properties: dict[str, dict[str, str]] = field(default_factory=dict)
+    # {org: {prop_name: value_type}}; fetched once per org in migrate_all, not from JSON
+    _org_property_schemas: dict[str, dict[str, str]] = field(default_factory=dict, repr=False, compare=False)
     repos: list[RepoSpec] = field(default_factory=list)
 
 
@@ -933,17 +936,17 @@ def _create_github_repo(
     org: str,
     name: str,
     visibility: str,
-    custom_properties: dict[str, str] | None = None,
+    custom_properties: "dict[str, str | list[str] | None] | None" = None,
 ) -> tuple[bool, bool]:
     """Create the GitHub repository.
 
     Returns (success, was_newly_created).
     was_newly_created=False means the repo already existed (re-run scenario).
 
-    *custom_properties* is passed directly to the GitHub API as
-    ``custom_properties`` so that orgs with required properties (especially
-    those with "Require explicit user-specified values" enabled) don't reject
-    the creation with HTTP 422.
+    *custom_properties* must already have values coerced to the correct wire type
+    (str for string/single_select/true_false/url, list[str] for multi_select,
+    None for clearing a property). Injected verbatim into the creation payload
+    so that orgs with required properties don't reject with HTTP 422.
     """
     _body: dict = {
         "name": name,
@@ -1713,9 +1716,14 @@ def _mirror_repo(
             )
 
         # Create GitHub repo if it doesn't exist yet.
-        _creation_props = config.repo_custom_properties.get(
-            f"{spec.target_org}/{spec.target_name}"
-        ) or None
+        _raw_props = config.repo_custom_properties.get(f"{spec.target_org}/{spec.target_name}")
+        _creation_props: "dict[str, str | list[str] | None] | None" = None
+        if _raw_props:
+            _schema = config._org_property_schemas.get(spec.target_org, {})
+            _creation_props = {
+                k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
+                for k, v in _raw_props.items()
+            }
         repo_created, _ = _create_github_repo(
             client, spec.target_org, name, spec.visibility,
             custom_properties=_creation_props,
@@ -3548,6 +3556,16 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
     gh_actor = _get_github_actor(client, config.auth)
     if gh_actor:
         log.info(f"Authenticated as: {gh_actor}")
+
+    # Pre-fetch property schemas for orgs that have custom properties to inject at creation.
+    # Done once here (before threads launch) so _mirror_repo workers only do dict lookups.
+    if config.repo_custom_properties:
+        orgs_with_props = {
+            key.split("/", 1)[0] for key in config.repo_custom_properties
+        }
+        for org in sorted(orgs_with_props):
+            config._org_property_schemas[org] = _fetch_org_property_schema(client, org)
+
     state = MigrationState(_CHECKPOINT_FILE)
 
     # Split repos into already-done (skip) and pending (process).
@@ -3716,12 +3734,96 @@ def _load_repo_properties_csv(csv_path: Path) -> dict[str, dict[str, str]]:
                 continue
             key = f"{org}/{name}"
             props = {p: (row.get(p) or "").strip() for p in prop_cols}
-            # Drop empty values -- omit properties that have no value so we
-            # don't accidentally clear existing values with an empty string.
+            # Keep the null sentinel (__null__) to allow intentional clearing of a property.
+            # Drop plain empty strings -- no value means "leave as-is", not "clear".
             props = {k: v for k, v in props.items() if v}
             if props:
                 result[key] = props
     return result
+
+
+def _fetch_org_property_schema(client: GitHubClient, org: str) -> dict[str, str]:
+    """Return {property_name: value_type} for all properties in the org schema.
+
+    Returns {} when the schema cannot be fetched (insufficient permissions, network error, etc.)
+    so callers degrade gracefully rather than blocking the migration.
+    """
+    try:
+        status, body = client.request("GET", f"/orgs/{org}/properties/schema")
+        if status != 200:
+            log.debug(f"Could not fetch property schema for org '{org}' (HTTP {status})")
+            return {}
+        entries: list[dict] = body if isinstance(body, list) else []
+        return {
+            e["property_name"]: e.get("value_type", "string")
+            for e in entries
+            if "property_name" in e
+        }
+    except Exception as exc:
+        log.debug(f"Property schema fetch for org '{org}' failed: {exc}")
+        return {}
+
+
+_GITHUB_PROPERTY_TYPES = frozenset({"string", "single_select", "multi_select", "true_false", "url"})
+
+# Sentinel string in CSV that explicitly clears a property (sets API value to null).
+_PROP_NULL_SENTINEL = "__null__"
+
+
+def _coerce_property_value(
+    raw: str,
+    value_type: str,
+    prop_name: str = "",
+) -> "str | list[str] | None":
+    """Convert a raw CSV cell to the exact value type the GitHub API expects.
+
+    GitHub custom property value types and their wire format:
+      string        -> str  (any text; no further coercion)
+      single_select -> str  (must match one of the schema's allowed_values; passed as-is)
+      true_false    -> str  "true" | "false"  (normalised to lowercase)
+      url           -> str  (validated to start with http:// or https://)
+      multi_select  -> list[str]  (semicolon-separated in CSV: "v1;v2" -> ["v1", "v2"])
+
+    Clearing a property:
+      Use the sentinel value "__null__" in the CSV cell to send null to the API,
+      which removes / unsets the property from the repository.
+
+    Returns None for the null sentinel so the caller can emit {"value": null}.
+    Logs a warning for unrecognised value_type and falls back to plain string.
+    """
+    if raw == _PROP_NULL_SENTINEL:
+        return None
+
+    if value_type == "multi_select":
+        return [v.strip() for v in raw.split(";") if v.strip()]
+
+    if value_type == "true_false":
+        normalised = raw.strip().lower()
+        if normalised not in ("true", "false"):
+            log.warning(
+                f"Property '{prop_name}' (true_false): invalid value {raw!r}. "
+                "Expected 'true' or 'false'. Sending as-is; GitHub may reject with HTTP 422."
+            )
+            return raw
+        return normalised
+
+    if value_type == "url":
+        stripped = raw.strip()
+        if not (stripped.startswith("http://") or stripped.startswith("https://")):
+            log.warning(
+                f"Property '{prop_name}' (url): value {raw!r} does not start with "
+                "http:// or https://. GitHub may reject with HTTP 422."
+            )
+        return stripped
+
+    if value_type not in _GITHUB_PROPERTY_TYPES:
+        log.debug(
+            f"Property '{prop_name}': unknown value_type {value_type!r}. "
+            "Treating as string."
+        )
+
+    # string, single_select, and unknown types: pass through as-is.
+    return raw
 
 
 def _validate_org_property_schema(
@@ -3730,26 +3832,14 @@ def _validate_org_property_schema(
     property_names: set[str],
 ) -> list[str]:
     """Return property names not defined in the org schema, or [] if validation cannot run."""
-    try:
-        status, body = client.request("GET", f"/orgs/{org}/properties/schema")
-        if status == 403:
-            log.warning(
-                f"[post-migration] Insufficient permissions to read org property schema "
-                f"for '{org}' (HTTP 403). Skipping validation -- GitHub will reject unknown names."
-            )
-            return []
-        if status != 200:
-            log.warning(
-                f"[post-migration] Could not fetch property schema for org '{org}' "
-                f"(HTTP {status}). Skipping validation."
-            )
-            return []
-        schema: list[dict] = body if isinstance(body, list) else []
-        defined = {entry["property_name"] for entry in schema if "property_name" in entry}
-        return sorted(property_names - defined)
-    except Exception as exc:
-        log.warning(f"[post-migration] Schema validation request failed: {exc}. Continuing.")
+    schema_map = _fetch_org_property_schema(client, org)
+    if not schema_map:
+        log.warning(
+            f"[post-migration] Could not read property schema for org '{org}'. "
+            "Skipping validation -- GitHub will reject unknown property names."
+        )
         return []
+    return sorted(property_names - set(schema_map))
 
 
 def _set_repo_properties(
@@ -3758,14 +3848,27 @@ def _set_repo_properties(
     repo: str,
     properties: dict[str, str],
     label: str,
+    schema_map: "dict[str, str] | None" = None,
 ) -> tuple[bool, str]:
-    """PATCH /repos/{org}/{repo}/properties/values. Returns (ok, error_message)."""
+    """PATCH /repos/{org}/{repo}/properties/values. Returns (ok, error_message).
+
+    *schema_map* is {property_name: value_type}. When not supplied it is fetched
+    from the org schema so that values are coerced to the correct wire type.
+    Supports all GitHub property types: string, single_select, multi_select,
+    true_false, url. Use the CSV sentinel '__null__' to clear a property (null).
+    """
     if not properties:
         return True, ""
+    if schema_map is None:
+        schema_map = _fetch_org_property_schema(client, org)
+    coerced = {
+        k: _coerce_property_value(v, schema_map.get(k, "string"), prop_name=k)
+        for k, v in properties.items()
+    }
     payload = {
         "properties": [
-            {"property_name": k, "value": v}
-            for k, v in properties.items()
+            {"property_name": k, "value": v}  # None serialises to JSON null -- intentional
+            for k, v in coerced.items()
         ]
     }
     try:
@@ -3821,19 +3924,25 @@ def run_post_migration(
         max_retries=_DEFAULT_API_RETRIES,
     )
 
-    # Collect all orgs referenced in the CSV
+    # Fetch schema per org: used for both validation and value coercion (multi_select needs arrays).
     orgs_in_csv: set[str] = {key.split("/", 1)[0] for key in props_map}
-    all_prop_names: set[str] = set()
-    for props in props_map.values():
-        all_prop_names.update(props.keys())
+    all_prop_names: set[str] = {p for props in props_map.values() for p in props}
+    org_schemas: dict[str, dict[str, str]] = {}
 
     for org in sorted(orgs_in_csv):
-        undefined = _validate_org_property_schema(client, org, all_prop_names)
-        if undefined:
+        schema = _fetch_org_property_schema(client, org)
+        org_schemas[org] = schema
+        if schema:
+            undefined = sorted(all_prop_names - set(schema))
+            if undefined:
+                log.warning(
+                    f"[post-migration] Org '{org}': property name(s) not in schema -- {undefined}. "
+                    "Define them in GitHub → Org Settings → Custom Properties before proceeding."
+                )
+        else:
             log.warning(
-                f"[post-migration] Org '{org}': the following property names are NOT defined "
-                f"in the schema -- {undefined}. Requests for these will likely return HTTP 422. "
-                "Define them in GitHub → Org Settings → Custom Properties before proceeding."
+                f"[post-migration] Could not read property schema for org '{org}'. "
+                "Value coercion will default to string; multi_select may fail."
             )
 
     # ---- Load checkpoint to find succeeded repos -----------------------
@@ -3871,7 +3980,10 @@ def run_post_migration(
             skipped.append({"source": key, "target": target_key, "reason": "not in repo-properties.csv"})
             continue
 
-        ok, err = _set_repo_properties(client, spec.target_org, spec.target_name, props, target_key)
+        ok, err = _set_repo_properties(
+            client, spec.target_org, spec.target_name, props, target_key,
+            schema_map=org_schemas.get(spec.target_org),
+        )
         if ok:
             applied.append({"source": key, "target": target_key, "properties": props})
         else:
