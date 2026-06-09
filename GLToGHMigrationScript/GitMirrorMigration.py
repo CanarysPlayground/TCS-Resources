@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,19 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+
+def _vclen(s: str) -> int:
+    """Visual terminal column width of *s* (wide/fullwidth chars count as 2)."""
+    n = 0
+    for ch in s:
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def _vcljust(s: str, width: int) -> str:
+    """Left-justify *s* in a field of *width* visual columns."""
+    return s + " " * max(0, width - _vclen(s))
+
 
 try:
     __import__("openpyxl")  # availability probe; used lazily in _write_xlsx
@@ -265,17 +279,28 @@ class _ColorFormatter(logging.Formatter):
     """
 
     # (badge_color, body_base_color)
-    # INFO body uses "\x1b[2;39m" (dim default-fg) so it renders as a
-    # comfortable medium-gray on dark terminals instead of glaring bright white.
+    # Palette designed for dark terminals.  Each level has a distinct hue so
+    # severity is scannable at a glance, and no body color shares both hue
+    # and weight with the inline highlights used by _recolor_info:
+    #   [label]      → bold bright-cyan   \x1b[1;96m
+    #   action words → bold bright-white  \x1b[1;97m
+    #   numbers      → bright-cyan        \x1b[96m
+    #   URLs         → bright-blue        \x1b[94m
     _LEVEL_STYLES: dict[int, tuple[str, str]] = {
-        logging.DEBUG:    ("\x1b[36m",    "\x1b[2;90m"),   # cyan badge,         dim dark-gray body
-        logging.INFO:     ("\x1b[32m",    "\x1b[2;39m"),   # green badge,        dim default-fg body
-        logging.WARNING:  ("\x1b[1;33m",  "\x1b[33m"),     # bold-yellow badge,  yellow body
-        logging.ERROR:    ("\x1b[1;31m",  "\x1b[31m"),     # bold-red badge,     red body
-        logging.CRITICAL: ("\x1b[1;35m",  "\x1b[1;35m"),  # bold-magenta badge + body
+        logging.DEBUG:    ("\x1b[96m",    "\x1b[90m"),    # bright-cyan badge,       dark-gray body
+        logging.INFO:     ("\x1b[1;92m",  "\x1b[97m"),    # bold bright-green badge, bright-white body
+        logging.WARNING:  ("\x1b[1;33m",  "\x1b[33m"),    # bold-yellow badge,       yellow body
+        logging.ERROR:    ("\x1b[1;31m",  "\x1b[31m"),    # bold-red badge,          red body
+        logging.CRITICAL: ("\x1b[1;35m",  "\x1b[1;35m"), # bold-magenta badge + body
     }
-    _TS_COLOR = "\x1b[2;90m"
+    _TS_COLOR = "\x1b[90m"   # dark-gray timestamp (metadata, subdued but readable)
     _RESET    = "\x1b[0m"
+
+    # Cache one Formatter instance per (fmt_string, datefmt) combination.
+    # logging.Formatter is not expensive to construct but it allocates and
+    # compiles a regex on every call -- under a 100-worker migration with
+    # thousands of log lines this adds up to millions of wasted allocations.
+    _fmt_cache: dict[str, "logging.Formatter"] = {}
 
     # ---------------------------------------------------------------------------
     # Compiled patterns for INFO inline recoloring.
@@ -316,7 +341,7 @@ class _ColorFormatter(logging.Formatter):
         msg = self._RE_LABEL.sub(
             lambda m: f"\x1b[1;96m[{m.group(1)}]{R}", msg
         )
-        # 2. Action words → bold bright-white  (pop against dim-gray base)
+        # 2. Action words → bold bright-white (bold differentiates from plain body)
         msg = self._RE_ACTION.sub(
             lambda m: f"\x1b[1;97m{m.group()}{R}", msg
         )
@@ -324,13 +349,13 @@ class _ColorFormatter(logging.Formatter):
         msg = self._RE_NUM_UNIT.sub(
             lambda m: f"\x1b[96m{m.group(1)}{R} {m.group(2)}", msg
         )
-        # 4. Durations → bright-cyan  (time values deserve attention)
+        # 4. Durations → bright-cyan
         msg = self._RE_DURATION.sub(
             lambda m: f"\x1b[96m{m.group()}{R}", msg
         )
-        # 5. URLs → dim cyan  (visible but not distracting)
+        # 5. URLs → bright-blue (distinct from bright-cyan numbers and bold-cyan labels)
         msg = self._RE_URL.sub(
-            lambda m: f"\x1b[2;36m{m.group()}{R}", msg
+            lambda m: f"\x1b[94m{m.group()}{R}", msg
         )
         return msg
 
@@ -349,14 +374,19 @@ class _ColorFormatter(logging.Formatter):
         rec.msg  = msg
         rec.args = ()
 
-        # %-8s pads the level name so all columns align:
-        # DEBUG=5, INFO=4, WARNING=7, ERROR=5, CRITICAL=8 chars → pad to 8.
+        # The level name is not padded -- brackets auto-fit to the label width:
+        # [DEBUG] [INFO] [WARNING] [ERROR] [CRITICAL]
         fmt = (
             f"{self._TS_COLOR}%(asctime)s{self._RESET} "
-            f"{badge_color}\x1b[1m[%(levelname)-8s]{self._RESET} "
+            f"{badge_color}\x1b[1m[%(levelname)s]{self._RESET} "
             f"{body_color}%(message)s{self._RESET}"
         )
-        return logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S").format(rec)
+        _datefmt = "%Y-%m-%d %H:%M:%S"
+        formatter = self._fmt_cache.get(fmt)
+        if formatter is None:
+            formatter = logging.Formatter(fmt, datefmt=_datefmt)
+            self._fmt_cache[fmt] = formatter
+        return formatter.format(rec)
 
 
 def _enable_windows_ansi() -> None:
@@ -465,7 +495,7 @@ class PATAuth(_Auth):
 class GitHubAppAuth(_Auth):
 
     _REFRESH_BUFFER_SECONDS = 300   # refresh 5 min before expiry
-    _JWT_EXPIRY_SECONDS = 540       # 9 min (GitHub max is 10 min)
+    _JWT_EXPIRY_SECONDS = 120       # 2 min (GitHub max is 10 min)
 
     def __init__(
         self,
@@ -780,6 +810,11 @@ class MigrationConfig:
     lfs_enabled: bool = True                           # fetch+push LFS objects when git-lfs is available
     detailed_commit_count: bool = False                # count commits via rev-list (slow on large repos)
     check_oversized_files: bool = True                 # scan for blobs > 100 MB before pushing (GitHub hard limit)
+    sync_mode: bool = False                            # delta/sync mode: push only new/missing refs; skip if repo absent on GitHub
+    # Persistent directory for bare-mirror clones.  Each repo is cloned here and
+    # kept after migration as a local backup.  Sub-structure: <local_clone_dir>/<org>/<repo>.git
+    # pathlib.Path is used throughout so the layout is compatible on all OS/flavours.
+    local_clone_dir: Path = field(default_factory=lambda: Path("local-clones"))  # relative = resolved from script dir
     ci_skeleton: CiSkeletonConfig | None = None        # CI skeleton creation config; None = disabled
     # "org/repo" -> {prop: raw_csv_val}; raw strings loaded from repo-properties.csv
     repo_custom_properties: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -815,6 +850,14 @@ class _RepoResult:
     missing_branches: list[str] = field(default_factory=list)       # source branches absent on GitHub
     missing_tags: list[str] = field(default_factory=list)           # source tags absent on GitHub
     branch_sha_mismatches: list[str] = field(default_factory=list)  # "branch: src_sha != gh_sha"
+    # GitHub-extra content -- branches/tags present on GitHub that are absent in GitLab.
+    # Populated when a push is skipped to protect GitHub-only content.
+    gh_only_branches: list[str] = field(default_factory=list)       # GitHub branches absent in GitLab
+    gh_only_tags: list[str] = field(default_factory=list)           # GitHub tags absent in GitLab
+    # Sync/delta mode detail -- populated when sync_mode=True
+    delta_pushed_branches: list[str] = field(default_factory=list)  # branches pushed in delta run
+    delta_pushed_tags: list[str] = field(default_factory=list)      # tags pushed in delta run
+    delta_diverged_branches: list[str] = field(default_factory=list) # diverged branches that caused repo skip
     # LFS migration detail
     lfs_detected: bool = False          # True if LFS objects were found in the source repo
     lfs_object_count: int = 0           # number of LFS objects migrated
@@ -825,6 +868,12 @@ class _RepoResult:
     # CI skeleton creation detail (populated after successful push when ci_skeleton is enabled)
     ci_skeleton_status: str = ""        # "created" | "partial" | "skipped_all" | "failed" | "not_configured" | "dry-run"
     ci_skeleton_branches_created: list[str] = field(default_factory=list)
+    # Machine-readable reason why status=="skipped".  Values:
+    #   "checkpoint"      -- previously migrated, confirmed on GitHub
+    #   "gh_repo_exists"  -- initial migration: GitHub repo already exists
+    #   "sync_diverged"   -- sync_mode: diverged branches detected
+    #   "sync_no_repo"    -- sync_mode: GitHub repo not found
+    skip_reason: str = ""
     ci_skeleton_branches_skipped: list[str] = field(default_factory=list)
     ci_skeleton_error: str = ""
     # Custom properties detail
@@ -846,6 +895,15 @@ class _CiSkeletonResult:
 class _MirrorResult:
     """Return type of _mirror_repo -- avoids a wide positional tuple."""
     ok: bool
+    # True when the repo was skipped because it already existed on GitHub.
+    # Distinct from ok=False (hard failure): skipped repos are not retried and
+    # are reported with status="skipped" rather than "failed".
+    skipped: bool = False
+    # Machine-readable reason why skipped=True was set.  Values:
+    #   "gh_repo_exists"  -- initial migration: GitHub repo already exists
+    #   "sync_diverged"   -- sync_mode: diverged branches detected
+    #   "sync_no_repo"    -- sync_mode: GitHub repo not found
+    skip_reason: str = ""
     default_branch: str = ""
     error: str = ""
     branch_count: int = 0
@@ -863,6 +921,14 @@ class _MirrorResult:
     missing_branches: list[str] = field(default_factory=list)
     missing_tags: list[str] = field(default_factory=list)
     branch_sha_mismatches: list[str] = field(default_factory=list)
+    # GitHub-extra content -- branches/tags on GitHub absent in GitLab.
+    # Populated when a push is skipped to protect GitHub-only content.
+    gh_only_branches: list[str] = field(default_factory=list)
+    gh_only_tags: list[str] = field(default_factory=list)
+    # Sync/delta mode detail
+    delta_pushed_branches: list[str] = field(default_factory=list)
+    delta_pushed_tags: list[str] = field(default_factory=list)
+    delta_diverged_branches: list[str] = field(default_factory=list)
     lfs_detected: bool = False
     lfs_object_count: int = 0
     # True when GitHub HEAD is strictly *ahead* of GitLab HEAD on the default
@@ -889,9 +955,18 @@ class MigrationState:
             try:
                 self._state = json.loads(self._file.read_text(encoding="utf-8"))
                 n_done = sum(1 for v in self._state.values() if v == "succeeded")
+                # Back up the existing checkpoint before this run modifies it.
+                # The backup is a sibling file with a datetime stamp so each run
+                # leaves an auditable copy of the state it resumed from.
+                _ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                _backup = self._file.with_name(
+                    f"{self._file.stem}-backup-{_ts}{self._file.suffix}"
+                )
+                shutil.copy2(self._file, _backup)
                 log.info(
                     f"Checkpoint found: {self._file.name} "
-                    f"({n_done} succeeded, {len(self._state)} total entries)"
+                    f"({n_done} succeeded, {len(self._state)} total entries) -- "
+                    f"backup saved as {_backup.name}"
                 )
             except Exception as exc:
                 log.warning(f"Could not read checkpoint ({exc}). Starting fresh.")
@@ -908,9 +983,22 @@ class MigrationState:
             # "partial" is NOT considered done -- re-run will retry the failed sub-steps.
             return self._state.get(key) == "succeeded"
 
+    def is_sub_step_done(self, key: str, step: str) -> bool:
+        """Return True if the named sub-step (e.g. 'ci_skeleton', 'custom_props')
+        was recorded as completed for this repo key in a previous run."""
+        with self._lock:
+            return self._state.get(f"{key}:{step}") == "done"
+
     def record(self, key: str, status: str) -> None:
         with self._lock:
             self._state[key] = status
+            self._save()
+
+    def record_sub_step(self, key: str, step: str) -> None:
+        """Atomically record a sub-step as done.  Written alongside the main key
+        so a future re-run can skip this sub-step without re-querying GitHub."""
+        with self._lock:
+            self._state[f"{key}:{step}"] = "done"
             self._save()
 
 
@@ -1024,7 +1112,9 @@ def _run_git(
                             except subprocess.TimeoutExpired:
                                 pass
                             return 1, "", f"git timed out after {timeout}s: {display}"
-                        time.sleep(0.25)
+                        # 50ms poll: fine-grained enough for interactive progress
+                        # output without burning CPU on short-lived git commands.
+                        time.sleep(0.05)
                     reader.join(timeout=10)
                     stdout_reader.join(timeout=10)
                     stdout_b = b"".join(stdout_chunks)
@@ -1572,14 +1662,33 @@ def _filter_branches(
     sample = ", ".join(sorted(to_delete)[:8])
     suffix = f", +{len(to_delete) - 8} more" if len(to_delete) > 8 else ""
     log.info(f"[{label}] Branch filter: {len(kept)} kept, {len(to_delete)} removed ({sample}{suffix})")
-    for branch in to_delete:
-        c, _, e = _run_git(
-            ["git", "update-ref", "-d", f"refs/heads/{branch}"],
-            cwd=mirror_dir,
-            timeout=15,
+    # Batch all deletions into a single git update-ref --stdin invocation instead
+    # of one subprocess per branch -- avoids N process-launch overheads on repos
+    # with many filtered branches.
+    stdin_payload = "".join(f"delete refs/heads/{b}\n" for b in sorted(to_delete))
+    try:
+        _batch = subprocess.run(
+            ["git", "update-ref", "--stdin"],
+            input=stdin_payload.encode(),
+            capture_output=True,
+            cwd=str(mirror_dir.resolve()),
+            timeout=30,
         )
-        if c != 0:
-            log.warning(f"[{label}] Could not remove branch '{branch}': {e}")
+        _batch_ok = _batch.returncode == 0
+        _batch_err = _batch.stderr.decode("utf-8", errors="replace").strip()
+    except (subprocess.TimeoutExpired, OSError) as _exc:
+        _batch_ok, _batch_err = False, str(_exc)
+    if not _batch_ok:
+        # Fall back to one-by-one only if batch mode fails (ancient git versions).
+        log.debug(f"[{label}] Batch ref deletion failed ({_batch_err}) -- retrying one by one")
+        for branch in sorted(to_delete):
+            rc, _, err = _run_git(
+                ["git", "update-ref", "-d", f"refs/heads/{branch}"],
+                cwd=mirror_dir,
+                timeout=15,
+            )
+            if rc != 0:
+                log.warning(f"[{label}] Could not remove branch '{branch}': {err}")
 
 
 # ===========================================================================
@@ -1916,6 +2025,263 @@ def _ls_remote_refs(
     return default_branch, branch_shas, tag_names
 
 
+def _delta_sync_repo(
+    spec: RepoSpec,
+    config: MigrationConfig,
+    client: GitHubClient,
+    clone_url: str,
+    safe_clone: str,
+    safe_push: str,
+    name: str,
+    github_base: str,
+) -> _MirrorResult:
+    """Perform a delta/sync push for an existing GitHub repo.
+
+    Only refs present in GitLab but absent/behind on GitHub are pushed.
+    If any branch has diverged (neither ahead), the entire repo is skipped.
+    Tags present in GitLab but absent on GitHub are pushed; GitHub-only tags
+    are recorded and left untouched.
+
+    Returns a _MirrorResult.  ok=True means at least one push occurred (or
+    nothing was needed and the repo is already in sync).
+    """
+    org = spec.target_org or config.github_default_org
+    log = logging.getLogger(__name__)
+
+    # ── 1. Fetch GitLab ref metadata via ls-remote (fast, no clone) ──────────
+    gl_default_branch, gl_branch_shas, gl_tag_names = _ls_remote_refs(
+        clone_url, safe_clone, f"{spec.namespace}/{spec.project} (GitLab)", timeout=120
+    )
+    if not gl_branch_shas and not gl_tag_names:
+        # ls-remote failed or repo is completely empty on GitLab
+        return _MirrorResult(
+            ok=False,
+            error="sync_mode: could not read refs from GitLab source",
+            validation_status="failed",
+        )
+
+    # ── 2. Fetch GitHub ref metadata ─────────────────────────────────────────
+    gh_branch_shas: dict[str, str] = _get_github_branch_shas(client, org, name)
+    gh_tag_names: set[str] = _get_github_ref_names(client, f"/repos/{org}/{name}/tags")
+
+    # ── 3. Classify branches ─────────────────────────────────────────────────
+    push_branches: list[str] = []        # State A (new) + State C (GL ahead)
+    skip_branches: list[str] = []        # State B (identical) + GH-ahead
+    gh_only_branches: list[str] = []     # State D (GH-only)
+    diverged_branches: list[str] = []    # State E (diverged)
+
+    for branch, gl_sha in gl_branch_shas.items():
+        if branch not in gh_branch_shas:
+            # State A: new branch on GitLab, push it
+            push_branches.append(branch)
+        else:
+            gh_sha = gh_branch_shas[branch]
+            if gl_sha == gh_sha:
+                # State B: identical
+                skip_branches.append(branch)
+            elif _github_is_ahead(client, org, name, gh_sha, gl_sha):
+                # State C: GitLab is ahead of GitHub (fast-forward) -- push
+                push_branches.append(branch)
+            elif _github_is_ahead(client, org, name, gl_sha, gh_sha):
+                # GitHub is ahead of GitLab -- leave it alone
+                skip_branches.append(branch)
+            else:
+                # State E: diverged -- skip entire repo
+                diverged_branches.append(branch)
+
+    for branch in gh_branch_shas:
+        if branch not in gl_branch_shas:
+            # State D: GitHub-only branch
+            gh_only_branches.append(branch)
+
+    if diverged_branches:
+        msg = (
+            f"sync_mode: {len(diverged_branches)} diverged branch(es) detected -- "
+            f"skipping entire repo to avoid overwriting GitHub history: "
+            f"{', '.join(diverged_branches)}"
+        )
+        log.warning(f"[{spec.namespace}/{spec.project}] {msg}")
+        return _MirrorResult(
+            ok=False,
+            skipped=True,
+            skip_reason="sync_diverged",
+            error=msg,
+            validation_status="skipped",
+            validation_notes=msg,
+            gh_only_branches=gh_only_branches,
+            delta_diverged_branches=diverged_branches,
+        )
+
+    # ── 4. Classify tags ─────────────────────────────────────────────────────
+    push_tags = sorted(gl_tag_names - gh_tag_names)          # new tags to push
+    gh_only_tags = sorted(gh_tag_names - gl_tag_names)       # GH-only, leave alone
+
+    # ── 5. Nothing to do? ────────────────────────────────────────────────────
+    if not push_branches and not push_tags:
+        msg = "sync_mode: already in sync -- no new refs to push"
+        log.info(f"[{spec.namespace}/{spec.project}] {msg}")
+        return _MirrorResult(
+            ok=True,
+            skipped=False,
+            validation_status="match",
+            validation_notes=msg,
+            gh_only_branches=gh_only_branches,
+            gh_only_tags=gh_only_tags,
+            delta_pushed_branches=[],
+            delta_pushed_tags=[],
+        )
+
+    # ── 6. Clone or refresh the persistent local backup, then push ───────────
+    # The bare-mirror clone lives in the same local_clone_dir used by the
+    # initial migration.  Structure: <local_clone_dir>/<org>/<repo>.git
+    # If the clone was left by the initial migration we refresh it with
+    # git fetch --all --prune (much faster than a full re-clone); otherwise
+    # we do a fresh git clone --mirror.
+    safe_dir = _safe_dir_name(spec.project)
+    clone_parent_dir = config.local_clone_dir / _safe_dir_name(org)
+    clone_parent_dir.mkdir(parents=True, exist_ok=True)
+    mirror_dir = clone_parent_dir / f"{safe_dir}.git"
+
+    try:
+        with _disk_lock:
+            free_gb = shutil.disk_usage(clone_parent_dir).free / (1024 ** 3)
+            _disk_ok = free_gb >= config.min_free_disk_gb
+        if not _disk_ok:
+            return _MirrorResult(
+                ok=False,
+                error=(
+                    f"sync_mode: insufficient disk space: {free_gb:.1f} GB free, "
+                    f"need at least {config.min_free_disk_gb:.1f} GB"
+                ),
+            )
+
+        _clone_ok = False
+        if mirror_dir.exists():
+            # Refresh the existing bare clone: update the remote URL (in case the
+            # PAT rotated) then fetch all refs from origin.
+            log.info(f"[{name}] sync_mode: refreshing existing local clone at {mirror_dir}")
+            _url_rc, _, _url_err = _run_git(
+                ["git", "remote", "set-url", "origin", clone_url],
+                log_cmd=["git", "remote", "set-url", "origin", safe_clone],
+                cwd=mirror_dir,
+                timeout=30,
+            )
+            if _url_rc == 0:
+                fetch_ok, fetch_err = _git_with_retry(
+                    cmd=["git", "fetch", "--all", "--prune"],
+                    log_cmd=["git", "fetch", "--all", "--prune"],
+                    timeout=config.clone_timeout,
+                    max_retries=config.git_max_retries,
+                    label=name,
+                    action="Fetch (delta refresh)",
+                    cwd=mirror_dir,
+                    http_post_buffer=config.git_http_post_buffer,
+                )
+                if fetch_ok:
+                    _clone_ok = True
+                else:
+                    log.warning(
+                        f"[{name}] sync_mode: fetch refresh failed ({fetch_err}) -- "
+                        "falling back to fresh clone"
+                    )
+                    shutil.rmtree(mirror_dir, ignore_errors=True)
+            else:
+                log.warning(
+                    f"[{name}] sync_mode: could not update remote URL ({_url_err}) -- "
+                    "falling back to fresh clone"
+                )
+                shutil.rmtree(mirror_dir, ignore_errors=True)
+
+        if not _clone_ok:
+            log.info(f"[{name}] sync_mode: cloning {safe_clone}")
+            clone_ok, clone_err = _git_with_retry(
+                cmd=["git", "clone", "--mirror", clone_url, str(mirror_dir)],
+                log_cmd=["git", "clone", "--mirror", safe_clone, str(mirror_dir)],
+                timeout=config.clone_timeout,
+                max_retries=config.git_max_retries,
+                label=name,
+                action="Clone (delta)",
+                cleanup_dir=mirror_dir,
+            )
+            if not clone_ok:
+                return _MirrorResult(ok=False, error=clone_err)
+
+        # Build refspecs WITHOUT force prefix -- git will reject non-fast-forward
+        # as a safety guard against races.  State A branches are genuinely new
+        # so no force is needed; State C are confirmed fast-forward.
+        all_delta_refs: list[str] = (
+            [f"refs/heads/{b}:refs/heads/{b}" for b in push_branches]
+            + [f"refs/tags/{t}:refs/tags/{t}" for t in push_tags]
+        )
+
+        gh_base_no_scheme = github_base.split("://", 1)[-1]
+        batch_size = config.git_push_batch_size
+        ref_batches = (
+            [all_delta_refs[i : i + batch_size] for i in range(0, len(all_delta_refs), batch_size)]
+            if batch_size > 0 and len(all_delta_refs) > batch_size
+            else [all_delta_refs]
+        )
+        if len(ref_batches) > 1:
+            log.info(
+                f"[{name}] sync_mode: splitting {len(all_delta_refs)} refs into "
+                f"{len(ref_batches)} batches"
+            )
+
+        for batch_idx, ref_batch in enumerate(ref_batches, 1):
+            n_batches = len(ref_batches)
+            batch_label = f" (batch {batch_idx}/{n_batches})" if n_batches > 1 else ""
+
+            def _push_cmd_factory(  # type: ignore[misc]
+                _refspecs: list[str] = ref_batch,
+            ) -> tuple[list[str], list[str]]:
+                fresh_token = config.auth.get_token_for_git()
+                push_url = f"https://{fresh_token}@{gh_base_no_scheme}/{org}/{name}.git"
+                return (
+                    ["git", "push", "--no-thin", push_url] + _refspecs,
+                    ["git", "push", "--no-thin", safe_push] + _refspecs,
+                )
+
+            push_ok, push_err = _git_with_retry(
+                cmd=[], log_cmd=[],
+                cmd_factory=_push_cmd_factory,
+                timeout=config.push_timeout,
+                max_retries=config.git_max_retries,
+                label=name,
+                action=f"Push (delta){batch_label}",
+                cwd=mirror_dir,
+                http_post_buffer=config.git_http_post_buffer,
+                stream_stderr=True,
+            )
+            if not push_ok:
+                return _MirrorResult(ok=False, error=push_err)
+
+        log.info(
+            f"[{spec.namespace}/{spec.project}] sync_mode: pushed "
+            f"{len(push_branches)} branch(es) and {len(push_tags)} tag(s)"
+        )
+        log.info(f"[{name}] Local backup: {mirror_dir}")
+        return _MirrorResult(
+            ok=True,
+            validation_status="match",
+            validation_notes=(
+                f"sync_mode: pushed {len(push_branches)} branch(es), {len(push_tags)} tag(s)"
+            ),
+            gh_only_branches=gh_only_branches,
+            gh_only_tags=gh_only_tags,
+            delta_pushed_branches=sorted(push_branches),
+            delta_pushed_tags=sorted(push_tags),
+        )
+
+    except Exception as exc:
+        log.error(f"[{spec.namespace}/{spec.project}] sync_mode push failed: {exc}")
+        return _MirrorResult(
+            ok=False,
+            error=f"sync_mode push failed: {exc}",
+            validation_status="failed",
+        )
+    # No cleanup -- mirror_dir is kept as a local backup at: <local_clone_dir>/<org>/<repo>.git
+
+
 def _mirror_repo(
     spec: RepoSpec,
     config: MigrationConfig,
@@ -1939,15 +2305,100 @@ def _mirror_repo(
         log.info(f"[{name}] DRY RUN -- would clone {safe_clone} -> {safe_push}")
         return _MirrorResult(ok=True, default_branch="dry-run", validation_status="dry-run")
 
-    # Sanitize project name for safe temp-dir path (Windows + Linux safe).
+    # sync_mode (delta migration): repo must already exist on GitHub.
+    # We never create the repo here -- push only new/missing refs.
+    if config.sync_mode:
+        st, _ = client.request("GET", f"/repos/{spec.target_org}/{name}")
+        if st == 404:
+            msg = (
+                f"sync_mode: repo '{spec.target_org}/{name}' not found on GitHub -- "
+                "run initial migration first (sync_mode: false), then enable sync_mode"
+            )
+            log.warning(f"[{name}] {msg}")
+            return _MirrorResult(
+                ok=False,
+                skipped=True,
+                skip_reason="sync_no_repo",
+                error=msg,
+                validation_status="skipped",
+                validation_notes=msg,
+            )
+        if st != 200:
+            return _MirrorResult(
+                ok=False,
+                error=f"sync_mode: failed to check GitHub repo: HTTP {st}",
+                validation_status="failed",
+            )
+        return _delta_sync_repo(
+            spec, config, client,
+            clone_url, safe_clone, safe_push,
+            name, github_base,
+        )
+
+    # Check whether the GitHub repo needs to be created.
+    # This API call is the only thing we do before the skip guard below --
+    # no temp dirs, no disk checks, no clones until we know we're migrating.
+    _raw_props = config.repo_custom_properties.get(f"{spec.target_org}/{spec.target_name}")
+    _creation_props: "dict[str, str | list[str] | None] | None" = None
+    if _raw_props:
+        _schema = config._org_property_schemas.get(spec.target_org, {})
+        _creation_props = {
+            k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
+            for k, v in _raw_props.items()
+        }
+    repo_created, newly_created = _create_github_repo(
+        client, spec.target_org, name, spec.visibility,
+        custom_properties=_creation_props,
+    )
+    if not repo_created:
+        return _MirrorResult(ok=False, error="Failed to create GitHub repository")
+
+    # Fast-path: if the GitHub repo already existed, skip entirely.
+    # A push would risk overwriting content that may have diverged from GitLab
+    # (hotfixes, CI commits, manual work).  The operator must explicitly delete
+    # the GitHub repo and re-run to force re-migration.
+    if not newly_created:
+        gh_repo_url = f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}"
+        log.warning(
+            f"[{name}] GitHub repo already exists -- skipping migration to prevent "
+            f"overwriting existing content. Delete '{spec.target_org}/{name}' "
+            f"from GitHub and re-run to force re-migration."
+        )
+        return _MirrorResult(
+            ok=False,
+            skipped=True,
+            skip_reason="gh_repo_exists",
+            error=(
+                f"GitHub repo '{spec.target_org}/{name}' already exists -- "
+                "skipped to prevent overwriting existing content. "
+                "Delete it from GitHub and re-run to force re-migration."
+            ),
+            gh_repo_url=gh_repo_url,
+            validation_status="skipped",
+            validation_notes="repo already exists on GitHub -- migration skipped",
+        )
+
+    # Repo is freshly created -- safe to clone and push.
+    # The bare-mirror clone is placed in the persistent local_clone_dir so it
+    # survives after migration and serves as a local backup.
+    # Structure: <local_clone_dir>/<target_org>/<repo>.git
+    # pathlib.Path ensures this is cross-platform (Windows, Linux, macOS).
+    org = spec.target_org or config.github_default_org
     safe_dir = _safe_dir_name(spec.project)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="gitmirror_"))
-    mirror_dir = tmp_dir / f"{safe_dir}.git"
+    clone_parent_dir = config.local_clone_dir / _safe_dir_name(org)
+    clone_parent_dir.mkdir(parents=True, exist_ok=True)
+    mirror_dir = clone_parent_dir / f"{safe_dir}.git"
+
+    # Remove any stale clone left from a previous failed run before re-cloning.
+    if mirror_dir.exists():
+        log.debug(f"[{name}] Removing stale clone at {mirror_dir} before re-clone")
+        shutil.rmtree(mirror_dir, ignore_errors=True)
 
     try:
         # Per-repo disk space check: concurrent workers can drain disk mid-run.
+        # Placed here (after skip guard) so skipped repos never touch the filesystem.
         with _disk_lock:
-            free_gb = shutil.disk_usage(tmp_dir).free / (1024 ** 3)
+            free_gb = shutil.disk_usage(clone_parent_dir).free / (1024 ** 3)
             _disk_ok = free_gb >= config.min_free_disk_gb
         if not _disk_ok:
             return _MirrorResult(
@@ -1958,121 +2409,6 @@ def _mirror_repo(
                     "Free up space or lower migration.min_free_disk_gb."
                 ),
             )
-
-        # Create GitHub repo if it doesn't exist yet.
-        _raw_props = config.repo_custom_properties.get(f"{spec.target_org}/{spec.target_name}")
-        _creation_props: "dict[str, str | list[str] | None] | None" = None
-        if _raw_props:
-            _schema = config._org_property_schemas.get(spec.target_org, {})
-            _creation_props = {
-                k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
-                for k, v in _raw_props.items()
-            }
-        repo_created, newly_created = _create_github_repo(
-            client, spec.target_org, name, spec.visibility,
-            custom_properties=_creation_props,
-        )
-        if not repo_created:
-            return _MirrorResult(ok=False, error="Failed to create GitHub repository")
-
-        # Fast-path: if the GitHub repo already existed, check whether migration is
-        # already complete using git ls-remote (metadata only -- no object transfer).
-        # This avoids a full clone+push for repos that are already fully migrated,
-        # even when the checkpoint file has been deleted.
-        if not newly_created:
-            log.info(
-                f"[{name}] GitHub repo already exists -- checking via ls-remote "
-                "whether migration is already complete..."
-            )
-            _ls_db, _ls_br_shas, _ls_tag_names = _ls_remote_refs(
-                clone_url, safe_clone, name,
-                timeout=min(config.clone_timeout, 120),
-            )
-            if _ls_br_shas or _ls_tag_names:
-                _gh_br_shas = _get_github_branch_shas(client, spec.target_org, name)
-                _gh_tag_names = _get_github_ref_names(
-                    client, f"/repos/{spec.target_org}/{name}/tags"
-                )
-                _missing_br = sorted(set(_ls_br_shas) - set(_gh_br_shas))
-                _missing_tg = sorted(_ls_tag_names - _gh_tag_names)
-                # A branch where GitHub is strictly *ahead* of GitLab means GitHub
-                # has extra commits (e.g. .github CI skeleton) that are not on GitLab.
-                # Treating those as a mismatch would trigger a force-push that wipes
-                # those extra commits.  Use the compare API to distinguish "ahead"
-                # (safe to skip) from "behind/diverged" (needs re-push).
-                _sha_mismatch = []
-                _gh_ahead_branches = []
-                for _b in _ls_br_shas:
-                    if _b not in _gh_br_shas:
-                        continue  # counted in _missing_br already
-                    if _ls_br_shas[_b] == _gh_br_shas[_b]:
-                        continue  # SHAs match -- fine
-                    if _github_is_ahead(client, spec.target_org, name, _ls_br_shas[_b], _gh_br_shas[_b]):
-                        _gh_ahead_branches.append(_b)
-                    else:
-                        _sha_mismatch.append(_b)
-                if _gh_ahead_branches:
-                    log.info(
-                        f"[{name}] GitHub is ahead of GitLab on "
-                        f"{len(_gh_ahead_branches)} branch(es) "
-                        f"({', '.join(_gh_ahead_branches[:5])}{'...' if len(_gh_ahead_branches) > 5 else ''}) "
-                        "-- likely .github CI skeleton commits; excluded from mismatch check"
-                    )
-                if not _missing_br and not _missing_tg and not _sha_mismatch:
-                    _db = _ls_db or next(iter(_ls_br_shas), "")
-                    _db_sha = _ls_br_shas.get(_db, "")
-                    # Fetch commit count from GitHub for the default branch so the
-                    # progress line can show [Nb Nt Nc] even on the fast-exit path.
-                    _commit_count = _get_github_commit_count(
-                        client, spec.target_org, name, _db_sha
-                    ) if _db_sha else 0
-                    _commit_info = f", {_commit_count:,} commit(s) on '{_db}'" if _commit_count else ""
-                    # Determine whether GitHub HEAD is ahead of GitLab HEAD
-                    # (i.e. GitHub has .github CI skeleton commits on top).
-                    # If so, record gh_head_is_ahead=True so the report can
-                    # show a qualified match instead of a false mismatch.
-                    _current_gh_sha = _gh_br_shas.get(_db, "")
-                    _gh_ahead = _db_sha != _current_gh_sha and _github_is_ahead(
-                        client, spec.target_org, name, _db_sha, _current_gh_sha
-                    )
-                    if _gh_ahead:
-                        log.info(
-                            f"[{name}] Already fully migrated: {len(_ls_br_shas)} branch(es), "
-                            f"{len(_ls_tag_names)} tag(s), all GitLab SHAs present"
-                            f"{_commit_info} -- GitHub HEAD is ahead (extra .github commit(s)); skipping clone+push"
-                        )
-                    else:
-                        log.info(
-                            f"[{name}] Already fully migrated: {len(_ls_br_shas)} branch(es), "
-                            f"{len(_ls_tag_names)} tag(s), all SHAs match"
-                            f"{_commit_info} -- skipping clone+push"
-                        )
-                    return _MirrorResult(
-                        ok=True,
-                        default_branch=_db,
-                        branch_count=len(_ls_br_shas),
-                        head_commit_sha=_db_sha,
-                        gh_branch_count=len(_gh_br_shas),
-                        gh_head_commit_sha=_current_gh_sha,
-                        tag_count=len(_ls_tag_names),
-                        gh_tag_count=len(_gh_tag_names),
-                        commit_count=_commit_count,
-                        gh_repo_url=f"{config.github_url.rstrip('/')}/{spec.target_org}/{name}",
-                        validation_status="match",
-                        validation_notes=(
-                            "already migrated -- GitHub HEAD ahead by .github commit(s); GitLab history fully present"
-                            if _gh_ahead else
-                            "already migrated -- skipped clone+push"
-                        ),
-                        gh_head_is_ahead=_gh_ahead,
-                    )
-                log.info(
-                    f"[{name}] Incomplete migration detected: "
-                    f"{len(_missing_br)} missing branch(es), "
-                    f"{len(_missing_tg)} missing tag(s), "
-                    f"{len(_sha_mismatch)} SHA mismatch(es) -- proceeding with full clone+push"
-                )
-            # ls-remote returned empty refs (source empty or network error) -- fall through
 
         log.info(f"[{name}] Cloning {safe_clone}")
         ok, err = _git_with_retry(
@@ -2281,11 +2617,18 @@ def _mirror_repo(
         # Post-push validation: compare branch/tag name-sets and SHAs.
         log.info(f"[{name}] Validating migration against GitHub...")
 
-        gh_branch_shas: dict[str, str] = _get_github_branch_shas(client, spec.target_org, name)
+        # Fire both paginated API calls concurrently -- branches and tags are
+        # independent so there is no reason to wait for one before starting the other.
+        with ThreadPoolExecutor(max_workers=2) as _val_pool:
+            _fut_branches = _val_pool.submit(
+                _get_github_branch_shas, client, spec.target_org, name
+            )
+            _fut_tags = _val_pool.submit(
+                _get_github_ref_names, client, f"/repos/{spec.target_org}/{name}/tags"
+            )
+            gh_branch_shas: dict[str, str] = _fut_branches.result()
+            gh_tag_names:   set[str]        = _fut_tags.result()
         gh_branch_names: set[str] = set(gh_branch_shas.keys())
-        gh_tag_names:    set[str] = _get_github_ref_names(
-            client, f"/repos/{spec.target_org}/{name}/tags"
-        )
         gh_head_sha: str = gh_branch_shas.get(default_branch, "")
 
         missing_branches: list[str] = sorted(src_branch_names - gh_branch_names)
@@ -2382,12 +2725,17 @@ def _mirror_repo(
                 if rem_ok:
                     log.info(f"[{name}] Remediation push succeeded -- re-validating...")
 
-                    # Re-fetch GitHub state after remediation.
-                    gh_branch_shas = _get_github_branch_shas(client, spec.target_org, name)
+                    # Re-fetch GitHub state after remediation (parallel, same as initial validation).
+                    with ThreadPoolExecutor(max_workers=2) as _rval_pool:
+                        _rfut_br = _rval_pool.submit(
+                            _get_github_branch_shas, client, spec.target_org, name
+                        )
+                        _rfut_tg = _rval_pool.submit(
+                            _get_github_ref_names, client, f"/repos/{spec.target_org}/{name}/tags"
+                        )
+                        gh_branch_shas = _rfut_br.result()
+                        gh_tag_names   = _rfut_tg.result()
                     gh_branch_names = set(gh_branch_shas.keys())
-                    gh_tag_names = _get_github_ref_names(
-                        client, f"/repos/{spec.target_org}/{name}/tags"
-                    )
                     gh_head_sha = gh_branch_shas.get(default_branch, "")
 
                     missing_branches = sorted(src_branch_names - gh_branch_names)
@@ -2512,6 +2860,7 @@ def _mirror_repo(
             "all HEAD SHAs match"
             + (f" | LFS: {lfs_object_count} object(s) migrated" if lfs_detected else "")
         )
+        log.info(f"[{name}] Local backup: {mirror_dir}")
         return _MirrorResult(
             ok=True,
             default_branch=default_branch,
@@ -2536,9 +2885,8 @@ def _mirror_repo(
 
     except Exception as exc:
         return _MirrorResult(ok=False, error=str(exc))
-
-    finally:
-        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+    # No cleanup of mirror_dir on success -- the bare clone is kept as a local backup
+    # at: <local_clone_dir>/<org>/<repo>.git
 
 
 # ===========================================================================
@@ -2707,6 +3055,25 @@ def _check_placeholders(raw: dict) -> None:
             "(GitLab -> User Settings -> Access Tokens, scope: read_repository)"
         )
 
+    gh = raw.get("github", {})
+    if _is_placeholder(gh.get("default_org", "")):
+        issues.append(
+            "github.default_org -- replace with your target GitHub organisation name "
+            "(must already exist before migration runs)"
+        )
+    for _url_key, _url_label, _example in (
+        ("api_url", "github.api_url",
+         "https://api.github.com  OR  https://api.SUBDOMAIN.ghe.com  OR  https://GHES_HOST/api/v3"),
+        ("url", "github.url",
+         "https://github.com  OR  https://SUBDOMAIN.ghe.com  OR  https://GHES_HOST"),
+    ):
+        _val = gh.get(_url_key, "")
+        if _val and _is_placeholder(_val):
+            issues.append(
+                f"{_url_label} -- replace with your GitHub instance URL "
+                f"(e.g. {_example})"
+            )
+
     if issues:
         numbered = "\n".join(f"  {i + 1}. {m}" for i, m in enumerate(issues))
         raise _MissingConfigError(
@@ -2832,6 +3199,19 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
     lfs_enabled = bool(mig.get("lfs_enabled", True))
     detailed_commit_count = bool(mig.get("detailed_commit_count", False))
     check_oversized_files = bool(mig.get("check_oversized_files", True))
+    sync_mode = bool(mig.get("sync_mode", False))
+    if sync_mode:
+        log.info(
+            "Sync mode (delta migration) enabled -- only new/missing refs will be pushed; "
+            "repos absent on GitHub will be skipped; repos with diverged branches will be skipped entirely"
+        )
+
+    _raw_clone_dir = mig.get("local_clone_dir", "local-clones")
+    local_clone_dir = Path(_raw_clone_dir)
+    if not local_clone_dir.is_absolute():
+        local_clone_dir = (config_path.parent / local_clone_dir).resolve()
+    local_clone_dir.mkdir(parents=True, exist_ok=True)
+    log.info(f"Local clone directory: {local_clone_dir}")
 
     # CI skeleton configuration.
     ci_skeleton: CiSkeletonConfig | None = None
@@ -2898,6 +3278,8 @@ def load_config(config_path: Path, repos_csv_path: Path) -> MigrationConfig:
         lfs_enabled=lfs_enabled,
         detailed_commit_count=detailed_commit_count,
         check_oversized_files=check_oversized_files,
+        sync_mode=sync_mode,
+        local_clone_dir=local_clone_dir,
         ci_skeleton=ci_skeleton,
         repo_custom_properties=_load_repo_properties_for_creation(config_path.parent),
         repos=repos,
@@ -3155,12 +3537,140 @@ def _check_gitlab_token_expiry(gitlab_url: str, gitlab_pat: str, warn_days: int 
         )
 
 
+def _check_github_pat_expiry(client: "GitHubClient", warn_days: int = 7) -> None:
+    """Warn if the GitHub PAT expires within *warn_days* days.
+
+    Reads the 'GitHub-Authentication-Token-Expiration' response header that
+    GitHub injects on every authenticated API response (classic and fine-grained
+    PATs alike, since mid-2023).  When the header is absent the token either has
+    no expiry date set (valid forever) or the endpoint does not support the header
+    -- both cases are silently ignored.
+
+    Only meaningful in PAT auth mode.  GitHub App installation tokens expire in
+    1 hour by design and are refreshed automatically -- no action needed there.
+    """
+    # App tokens expire every hour and are auto-refreshed -- nothing to warn about.
+    if not isinstance(client._auth, PATAuth):
+        return
+
+    url = f"{client._api_base}/rate_limit"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": client._auth.get_auth_header(),
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            expiry_header = resp.headers.get("GitHub-Authentication-Token-Expiration", "")
+    except Exception:
+        return  # not critical -- skip silently if unreachable
+
+    if not expiry_header:
+        return  # no expiry date on this token (no-expiry classic PAT) or header absent
+
+    # Header format: "2024-01-01 00:00:00 UTC"
+    try:
+        expiry_dt = datetime.datetime.strptime(expiry_header.strip(), "%Y-%m-%d %H:%M:%S %Z")
+        expiry_date = expiry_dt.date()
+    except ValueError:
+        return  # unrecognised format -- skip
+
+    today = datetime.date.today()
+    days_left = (expiry_date - today).days
+    if days_left < 0:
+        raise RuntimeError(
+            f"GitHub PAT expired on {expiry_date}. "
+            "Generate a new token: GitHub \u2192 Settings \u2192 "
+            "Developer Settings \u2192 Personal access tokens."
+        )
+    if days_left < warn_days:
+        log.warning(
+            f"GitHub PAT expires in {days_left} day(s) (on {expiry_date}). "
+            "Renew it before the migration completes to avoid mid-run authentication failures: "
+            "GitHub \u2192 Settings \u2192 Developer Settings \u2192 Personal access tokens."
+        )
+
+
+def _check_github_pat_workflow_scope(
+    client: "GitHubClient",
+    ci_skeleton_enabled: bool = False,
+) -> None:
+    """Verify the GitHub classic PAT carries the 'workflow' scope.
+
+    The scope is required for any push that creates or modifies files under
+    .github/workflows/ -- this includes:
+      * Bare-mirror pushes from source repos that already contain workflow files.
+      * The CI-skeleton step, which writes .github/workflows/<file> via the
+        GitHub Contents API.
+
+    Behaviour by token type
+    -----------------------
+    Classic PAT  : GitHub returns X-OAuth-Scopes on every API response.
+                   Hard-fails when ci_skeleton is enabled and scope missing;
+                   warns only otherwise (source repos *may* have workflow files).
+    Fine-grained PAT : X-OAuth-Scopes is absent.  An informational note is logged
+                       reminding the user to grant the 'Workflows' repository
+                       permission.
+    GitHub App   : Skipped.  App permissions are configured in the App settings
+                   on GitHub, not embedded in individual tokens.
+    """
+    if not isinstance(client._auth, PATAuth):
+        return  # GitHub App -- permissions managed in App settings
+
+    url = f"{client._api_base}/rate_limit"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": client._auth.get_auth_header(),
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            scopes_header = resp.headers.get("X-OAuth-Scopes", "")
+    except Exception:
+        return  # non-critical -- skip silently on network failure
+
+    if not scopes_header:
+        # Fine-grained PAT: X-OAuth-Scopes is not returned by GitHub.
+        log.info(
+            "GitHub fine-grained PAT detected (no X-OAuth-Scopes header). "
+            "Ensure the token has the 'Workflows' repository permission if any "
+            "source repos contain .github/workflows/ files or if CI skeleton "
+            "creation is enabled."
+        )
+        return
+
+    # Classic PAT: parse the comma-separated scope list.
+    granted = {s.strip() for s in scopes_header.split(",")}
+    if "workflow" in granted:
+        log.debug("GitHub PAT 'workflow' scope present -- workflow file operations permitted")
+        return
+
+    msg = (
+        "GitHub PAT is missing the 'workflow' scope. "
+        "Pushes that create or modify .github/workflows/ files will be "
+        "rejected by GitHub with HTTP 403. "
+        "Add the 'workflow' scope: GitHub \u2192 Settings \u2192 Developer Settings "
+        "\u2192 Personal access tokens \u2192 Edit token \u2192 check 'workflow'."
+    )
+    if ci_skeleton_enabled:
+        raise RuntimeError(msg)
+    log.warning(msg)
+
+
 def _preflight_checks(config: MigrationConfig, client: GitHubClient) -> None:
     """Run all pre-flight checks before any migration work begins."""
     _check_disk_space(config.min_free_disk_gb, config.max_workers)
     _check_tmpfs()
     _check_file_descriptor_limit(config.max_workers)
     _check_github_connectivity(client)
+    _check_github_pat_expiry(client)
+    _check_github_pat_workflow_scope(client, ci_skeleton_enabled=config.ci_skeleton is not None)
     if not config.dry_run:
         _check_gitlab_connectivity(config.gitlab_url, config.gitlab_pat)
         _check_gitlab_token_expiry(config.gitlab_url, config.gitlab_pat)
@@ -3507,6 +4017,11 @@ def _write_reports(
                 "missing_branches": r.missing_branches,
                 "missing_tags": r.missing_tags,
                 "branch_sha_mismatches": r.branch_sha_mismatches,
+                "gh_only_branches": r.gh_only_branches,
+                "gh_only_tags": r.gh_only_tags,
+                "delta_pushed_branches": r.delta_pushed_branches,
+                "delta_pushed_tags": r.delta_pushed_tags,
+                "delta_diverged_branches": r.delta_diverged_branches,
                 "lfs_detected": r.lfs_detected,
                 "lfs_object_count": r.lfs_object_count,
                 "ci_skeleton_status": r.ci_skeleton_status,
@@ -3571,7 +4086,7 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
         writer = csv.writer(fh)
         writer.writerow([
             "source", "target", "gh_repo_url", "status", "visibility",
-            "default_branch", "default_branch_renamed", "duration_min",
+            "default_branch", "default_branch_renamed", "duration",
             "branch_count", "head_commit_sha", "tag_count",
             "gh_branch_count", "gh_head_commit_sha", "gh_tag_count",
             "validation_status", "validation_notes",
@@ -3580,6 +4095,7 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
             "custom_properties_status", "custom_properties_applied", "custom_properties_error",
             "ci_skeleton_status", "ci_skeleton_branches_created",
             "ci_skeleton_branches_skipped", "ci_skeleton_error",
+            "delta_branches_pushed", "delta_tags_pushed", "delta_diverged_branches",
             "error", "completed_at",
         ])
         for r in results:
@@ -3590,10 +4106,11 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
             writer.writerow([
                 r.source, r.target, r.gh_repo_url, r.status, r.visibility,
                 r.default_branch, r.default_branch_renamed,
-                round(r.duration_seconds / 60, 3) if r.duration_seconds else "",
+                _fmt_duration(r.duration_seconds) if r.duration_seconds else "",
                 r.branch_count or "", r.head_commit_sha, r.tag_count or "",
                 r.gh_branch_count or "", r.gh_head_commit_sha, r.gh_tag_count or "",
-                r.validation_status, r.validation_notes,
+                "SUCCESS" if r.validation_status == "match" else r.validation_status,
+                r.validation_notes,
                 "; ".join(r.missing_branches) if r.missing_branches else "",
                 "; ".join(r.missing_tags) if r.missing_tags else "",
                 "; ".join(r.branch_sha_mismatches) if r.branch_sha_mismatches else "",
@@ -3606,6 +4123,9 @@ def _write_csv_fallback(results: list[_RepoResult]) -> None:
                 "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
                 "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "",
                 r.ci_skeleton_error,
+                "; ".join(r.delta_pushed_branches) if r.delta_pushed_branches else "",
+                "; ".join(r.delta_pushed_tags) if r.delta_pushed_tags else "",
+                "; ".join(r.delta_diverged_branches) if r.delta_diverged_branches else "",
                 r.error, r.completed_at,
             ])
 
@@ -3673,7 +4193,7 @@ def _write_xlsx(
             if "not found" in err or "404" in err:
                 return "Verify source repo exists on GitLab and namespace is correct"
             if "permission" in err or "403" in err or "401" in err:
-                return "Check GitLab PAT has 'read_repository' scope; GitHub PAT needs 'repo' scope"
+                return "Check GitLab PAT has 'read_repository' scope; GitHub PAT needs 'repo' + 'workflow' scopes"
             if "timed out" in err:
                 return "Repo may be large -- increase clone_timeout_seconds / push_timeout_seconds"
             if "create github" in err or "github repo" in err:
@@ -3751,9 +4271,11 @@ def _write_xlsx(
     _sum_row("TIMING", "", is_section=True)
     _sum_row("Total Duration", _fmt_duration(elapsed_seconds))
     if m:
-        _sum_row("Min / Max per Repo",
-                 f"{m.get('min_seconds', 0)}s  /  {m.get('max_seconds', 0)}s")
-        _sum_row("Mean per Repo", f"{m.get('mean_seconds', 0)}s")
+        _sum_row(
+            "Min / Max per Repo",
+            f"{_fmt_duration(m.get('min_seconds', 0))}  /  {_fmt_duration(m.get('max_seconds', 0))}",
+        )
+        _sum_row("Mean per Repo", _fmt_duration(m.get('mean_seconds', 0)))
     if failed or partial:
         _sum_row("", "")
         _sum_row("FAILED / PARTIAL REPOSITORIES", "", is_section=True)
@@ -3777,7 +4299,8 @@ def _write_xlsx(
         "Branches Pushed", "Tags Pushed", "LFS Detected", "LFS Objects",
         "Custom Props Status", "Custom Props Applied", "Custom Props Error",
         "CI Skeleton", "CI Branches Created", "CI Branches Skipped", "CI Error",
-        "Duration (min)", "Completed At", "Git Error",
+        "Delta Branches Pushed", "Delta Tags Pushed", "Diverged Branches",
+        "Duration", "Completed At", "Git Error",
     ])
     CP_STATUS_FILLS = {
         "applied":        _fill("C6EFCE"),
@@ -3816,12 +4339,16 @@ def _write_xlsx(
             "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
             "; ".join(r.ci_skeleton_branches_skipped) if r.ci_skeleton_branches_skipped else "",
             r.ci_skeleton_error or "",
-            round(r.duration_seconds / 60, 2) if r.duration_seconds else "",
+            "; ".join(r.delta_pushed_branches) if r.delta_pushed_branches else "",
+            "; ".join(r.delta_pushed_tags) if r.delta_pushed_tags else "",
+            "; ".join(r.delta_diverged_branches) if r.delta_diverged_branches else "",
+            _fmt_duration(r.duration_seconds) if r.duration_seconds else "",
             r.completed_at,
             r.error or "",
         ]
-        # Columns that should wrap: Custom Props Applied(13), CP Error(14), CI Error(18), Git Error(21)
-        _wrap_cols_repos = {13, 14, 18, 21}
+        # Columns that should wrap: Custom Props Applied(13), CP Error(14), CI Error(18),
+        # Delta Branches(19), Delta Tags(20), Diverged Branches(21), Git Error(24)
+        _wrap_cols_repos = {13, 14, 18, 19, 20, 21, 24}
         # Column fill: cp cols 12-14 use cp_fill; ci cols 15-18 use ci_fill; rest use rf
         _cp_cols  = {12, 13, 14}
         _ci_cols  = {15, 16, 17, 18}
@@ -3834,7 +4361,7 @@ def _write_xlsx(
             c = ws_repos.cell(row=ri, column=ci, value=val)
             c.fill = cp_fill if ci in _cp_cols else ci_fill if ci in _ci_cols else rf
             c.alignment = WRAP if ci in _wrap_cols_repos else LEFT
-    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 14, 12, 12, 12, 18, 42, 40, 14, 30, 30, 40, 14, 22, 45])
+    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 14, 12, 12, 12, 18, 42, 40, 14, 30, 30, 40, 35, 25, 35, 16, 22, 45])
 
     # =========================================================================
     # Sheet 3: Failed & Mismatches (engineers -- actionable only)
@@ -3887,6 +4414,7 @@ def _write_xlsx(
         "Default Branch", "Renamed to main",
         "Validation Status", "Validation Notes",
         "Missing Branches", "Missing Tags", "Branch SHA Mismatches",
+        "Delta Branches Pushed", "Delta Tags Pushed", "Diverged Branches",
     ])
     # Tooltip / note fills for the ahead-case HEAD match cell
     _AHEAD_FILL = _fill("E2EFDA")   # soft green -- "match, but GitHub is ahead"
@@ -3916,15 +4444,18 @@ def _write_xlsx(
             _head_match,
             r.default_branch or "\u2014",
             "Yes" if r.default_branch_renamed else "No",
-            r.validation_status,
+            "SUCCESS" if r.validation_status == "match" else r.validation_status,
             r.validation_notes,
             "; ".join(r.missing_branches) if r.missing_branches else "",
             "; ".join(r.missing_tags) if r.missing_tags else "",
             "; ".join(r.branch_sha_mismatches) if r.branch_sha_mismatches else "",
+            "; ".join(r.delta_pushed_branches) if r.delta_pushed_branches else "",
+            "; ".join(r.delta_pushed_tags) if r.delta_pushed_tags else "",
+            "; ".join(r.delta_diverged_branches) if r.delta_diverged_branches else "",
         ]
         # Column indices that should wrap: notes(17), missing_branches(18),
-        # missing_tags(19), branch_sha_mismatches(20)
-        _wrap_cols = {17, 18, 19, 20}
+        # missing_tags(19), branch_sha_mismatches(20), delta cols(21-23)
+        _wrap_cols = {17, 18, 19, 20, 21, 22, 23}
         for ci, val in enumerate(vals, 1):
             if ci == 3:
                 if r.gh_repo_url:
@@ -3940,7 +4471,7 @@ def _write_xlsx(
             else:
                 c.fill = rf
             c.alignment = WRAP if ci in _wrap_cols else LEFT
-    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 18, 16, 18, 50, 45, 45, 55])
+    _col_widths(ws_val, [42, 38, 52, 14, 14, 14, 14, 12, 12, 12, 14, 14, 14, 18, 16, 18, 50, 45, 45, 55, 35, 25, 35])
 
     # =========================================================================
     # Sheet 5: Run Metrics (internal ops -- not for client)
@@ -3978,15 +4509,16 @@ def _write_xlsx(
         _met_row("  Branches",       ", ".join(config.ci_skeleton.branches))
         _met_row("  Skip If Exists", str(config.ci_skeleton.skip_if_exists))
     _met_row("Detailed Commit Count", str(config.detailed_commit_count))
+    _met_row("Sync Mode (Delta)",  "Yes" if config.sync_mode else "No")
     _met_row("Dry Run",            str(config.dry_run))
     _met_row("Rename to main",     str(config.rename_default_branch))
     _met_row("", "")
     _met_row("TIMING", "", is_section=True)
     _met_row("Total Duration", _fmt_duration(elapsed_seconds))
     if m:
-        _met_row("Min per Repo",   f"{m.get('min_seconds', 0)}s")
-        _met_row("Max per Repo",   f"{m.get('max_seconds', 0)}s")
-        _met_row("Mean per Repo",  f"{m.get('mean_seconds', 0)}s")
+        _met_row("Min per Repo",  _fmt_duration(m.get("min_seconds", 0)))
+        _met_row("Max per Repo",  _fmt_duration(m.get("max_seconds", 0)))
+        _met_row("Mean per Repo", _fmt_duration(m.get("mean_seconds", 0)))
 
     # =========================================================================
     # Sheet 6: Custom Properties Results
@@ -4091,59 +4623,87 @@ def _migrate_one(
 
     if config.dry_run:
         cp_status = "dry-run"
+    elif mr.skipped:
+        cp_status = "skipped"
     elif mr.ok:
         _raw_props = config.repo_custom_properties.get(target_key)
         if _raw_props:
             _schema = config._org_property_schemas.get(spec.target_org, {})
-            _ok, _err = _set_repo_properties(
-                client, spec.target_org, name, _raw_props, target_key,
-                schema_map=_schema,
-            )
-            if _ok:
-                cp_status = "applied"
-                # Coerce values for display (mirrors what _set_repo_properties sends)
-                cp_applied = {
-                    k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
-                    for k, v in _raw_props.items()
-                }
+            # Checkpoint-level skip: if this sub-step was recorded as done in a
+            # previous run we skip the GET comparison + PATCH entirely.
+            if state.is_sub_step_done(key, "custom_props"):
+                cp_status = "skipped"
                 log.info(
-                    f"[{name}] Custom properties applied ({len(cp_applied)}): "
-                    + ", ".join(
-                        f"{k}={v!r}" for k, v in cp_applied.items()
-                    )
+                    f"[{name}] Custom properties: already applied in previous run "
+                    "(checkpoint) -- skipped"
                 )
             else:
-                cp_status = "failed"
-                cp_error = _err
-                log.warning(f"[{name}] Custom properties FAILED: {_err}")
+                _ok, _err = _set_repo_properties(
+                    client, spec.target_org, name, _raw_props, target_key,
+                    schema_map=_schema,
+                )
+                if _ok:
+                    cp_status = "applied"
+                    state.record_sub_step(key, "custom_props")
+                    # Coerce values for display (mirrors what _set_repo_properties sends)
+                    cp_applied = {
+                        k: _coerce_property_value(v, _schema.get(k, "string"), prop_name=k)
+                        for k, v in _raw_props.items()
+                    }
+                    log.info(
+                        f"[{name}] Custom properties applied ({len(cp_applied)}): "
+                        + ", ".join(
+                            f"{k}={v!r}" for k, v in cp_applied.items()
+                        )
+                    )
+                else:
+                    cp_status = "failed"
+                    cp_error = _err
+                    log.warning(f"[{name}] Custom properties FAILED: {_err}")
         else:
             cp_status = "skipped"
             log.debug(f"[{name}] Custom properties: not in repo-properties.csv -- skipped")
 
     # ── Step 3: CI skeleton ──────────────────────────────────────────────────
+    # CI skeleton only runs when the git mirror push succeeded this run.
+    # Skipped repos (GitHub already existed) bypass this step entirely.
     ci_result = _CiSkeletonResult(status="not_configured")
     if config.ci_skeleton and config.ci_skeleton.enabled:
-        if config.dry_run or mr.ok:
-            ci_result = _create_ci_skeleton(spec, config, client, mr.default_branch)
-            if ci_result.status == "created":
+        if config.dry_run or (mr.ok or mr.skipped):
+            # Checkpoint-level skip: if this sub-step was recorded as done in a
+            # previous run (all target branches already had the workflow file)
+            # skip the GitHub Contents API calls entirely.
+            if not config.dry_run and state.is_sub_step_done(key, "ci_skeleton"):
+                ci_result = _CiSkeletonResult(status="skipped_all")
                 log.info(
-                    f"[{name}] CI skeleton created on: "
-                    + ", ".join(ci_result.branches_created)
+                    f"[{name}] CI skeleton: already created in previous run "
+                    "(checkpoint) -- skipped"
                 )
-            elif ci_result.status == "skipped_all":
-                log.info(
-                    f"[{name}] CI skeleton: already exists on all target branches -- skipped"
-                )
-            elif ci_result.status == "partial":
-                log.warning(
-                    f"[{name}] CI skeleton partial: created={ci_result.branches_created}, "
-                    f"skipped={ci_result.branches_skipped}"
-                    + (f", error={ci_result.error}" if ci_result.error else "")
-                )
-            elif ci_result.status == "failed":
-                log.warning(
-                    f"[{name}] CI skeleton FAILED: {ci_result.error}"
-                )
+            else:
+                ci_result = _create_ci_skeleton(spec, config, client, mr.default_branch)
+                if ci_result.status == "created":
+                    state.record_sub_step(key, "ci_skeleton")
+                    log.info(
+                        f"[{name}] CI skeleton created on: "
+                        + ", ".join(ci_result.branches_created)
+                    )
+                elif ci_result.status == "skipped_all":
+                    # All branches already had the file on GitHub -- record so
+                    # future re-runs don't re-check the Contents API.
+                    state.record_sub_step(key, "ci_skeleton")
+                    log.info(
+                        f"[{name}] CI skeleton: already exists on all target branches -- skipped"
+                    )
+                elif ci_result.status == "partial":
+                    log.warning(
+                        f"[{name}] CI skeleton partial: created={ci_result.branches_created}, "
+                        f"skipped={ci_result.branches_skipped}"
+                        + (f", error={ci_result.error}" if ci_result.error else "")
+                    )
+                elif ci_result.status == "failed":
+                    log.warning(
+                        f"[{name}] CI skeleton FAILED: {ci_result.error}"
+                    )
 
     # ── Determine overall status ─────────────────────────────────────────────
     # "succeeded"  : git ok AND (no props configured OR props applied) AND (CI not failed)
@@ -4151,6 +4711,8 @@ def _migrate_one(
     # "failed"     : git push/validate failed (hard failure)
     if config.dry_run:
         status = "dry-run"
+    elif mr.skipped:
+        status = "skipped"
     elif not mr.ok:
         status = "failed"
     else:
@@ -4171,10 +4733,14 @@ def _migrate_one(
             )
 
     if not config.dry_run:
+        # Skipped repos are not recorded in the checkpoint -- they were not migrated
+        # and should be re-evaluated on the next run (in case the operator deleted
+        # the GitHub repo to allow re-migration).
         # Checkpoint only marks fully succeeded or failed -- partial stays unresolved
         # so a re-run can retry the failed sub-steps.
-        state.record(key, "succeeded" if status == "succeeded" else
-                          "failed" if status == "failed" else "partial")
+        if status != "skipped":
+            state.record(key, "succeeded" if status == "succeeded" else
+                              "failed" if status == "failed" else "partial")
 
     return _RepoResult(
         source=key,
@@ -4201,8 +4767,14 @@ def _migrate_one(
         missing_branches=mr.missing_branches,
         missing_tags=mr.missing_tags,
         branch_sha_mismatches=mr.branch_sha_mismatches,
+        gh_only_branches=mr.gh_only_branches,
+        gh_only_tags=mr.gh_only_tags,
+        delta_pushed_branches=mr.delta_pushed_branches,
+        delta_pushed_tags=mr.delta_pushed_tags,
+        delta_diverged_branches=mr.delta_diverged_branches,
         lfs_detected=mr.lfs_detected,
         lfs_object_count=mr.lfs_object_count,
+        skip_reason=mr.skip_reason,
         ci_skeleton_status=ci_result.status,
         ci_skeleton_branches_created=ci_result.branches_created,
         ci_skeleton_branches_skipped=ci_result.branches_skipped,
@@ -4230,9 +4802,11 @@ def _print_migration_preview(
     DIVIDER = "\u2500" * W   # ───
 
     def _header(title: str) -> None:
-        pad = (W - len(title) - 2) // 2
+        tw = _vclen(title)
+        pad = (W - tw - 2) // 2
+        rpad = W - pad - tw - 2   # exact: pad + 1 + tw + 1 + rpad == W
         print(f"\n\u2554{BORDER}\u2557")
-        print(f"\u2551{' ' * pad} {title} {' ' * (W - pad - len(title) - 1)}\u2551")
+        print(f"\u2551{' ' * pad} {title} {' ' * rpad}\u2551")
         print(f"\u255a{BORDER}\u255d")
 
     def _kv(icon: str, label: str, value: str, width: int = 20) -> None:
@@ -4265,8 +4839,25 @@ def _print_migration_preview(
     print()
     _divider()
     if already_done:
-        _kv("\u2714\ufe0f", "Already done",
-            f"{len(already_done)} repo(s) \u2014 will be skipped (checkpoint)")
+        _kv(
+            "\u2714\ufe0f", "Already done",
+            f"{len(already_done)} repo(s) \u2014 will be skipped",
+        )
+        # One-liner reason: all entries here are checkpoint-verified on GitHub.
+        print(
+            f"  {'':20} "
+            f"\u2514\u2500 reason: checkpoint (previously migrated, confirmed on GitHub)"
+        )
+        # Compact list of skipped repos -- up to _PREVIEW_MAX_ROWS entries.
+        _SKIP_LIST_MAX = 8
+        shown_skip = already_done[:_SKIP_LIST_MAX]
+        for s in shown_skip:
+            label = f"{s.namespace}/{s.project}"
+            gh_label = f"{s.target_org or config.github_default_org}/{s.target_name}"
+            print(f"  {'':20}    \u2022 {label}  \u2192  {gh_label}")
+        overflow_skip = len(already_done) - len(shown_skip)
+        if overflow_skip > 0:
+            print(f"  {'':20}    \u2026 and {overflow_skip} more")
     _kv("\U0001f4e6", "Pending", f"{len(pending)} repo(s) to migrate")
     _divider()
 
@@ -4308,13 +4899,15 @@ def _print_migration_preview(
         return f"{src} " + "  ".join(parts)
 
 
-    src_w = min(max(len(HDR_SRC), max(len(f"{s.namespace}/{s.project}") for s in show)), 72)
-    tgt_w = min(max(len(HDR_TGT), max(len(f"{s.target_org}/{s.target_name}") for s in show)), 56)
-    vis_w = max(len(HDR_VIS), max(len(s.visibility) + 3 for s in show))  # +3 for vis icon
+    # Use _vclen (visual column width) so that wide emoji chars in headers and
+    # cell values don't cause border misalignment.
+    src_w = min(max(_vclen(HDR_SRC), max(_vclen(f"{s.namespace}/{s.project}") for s in show)), 72)
+    tgt_w = min(max(_vclen(HDR_TGT), max(_vclen(f"{s.target_org}/{s.target_name}") for s in show)), 56)
+    vis_w = max(_vclen(HDR_VIS), max(_vclen(f"{_VIS_ICONS.get(s.visibility, '')} {s.visibility}") for s in show))
 
     cols_w = [src_w, tgt_w, vis_w]
     if any_branch_filter:
-        cols_w.append(max(len(HDR_BR), max(len(_branch_label(s)) for s in show)))
+        cols_w.append(max(_vclen(HDR_BR), max(_vclen(_branch_label(s)) for s in show)))
 
     def _tsep(top: bool = False, bottom: bool = False) -> str:
         lc, mc, rc = (
@@ -4327,8 +4920,18 @@ def _print_migration_preview(
     def _trow(*cells: str) -> str:
         parts = []
         for cell, w in zip(cells, cols_w):
-            c = cell[:w - 3] + "\u2026" if len(cell) > w else cell
-            parts.append(f" {c:<{w}} ")
+            vcw = _vclen(cell)
+            if vcw > w:
+                # Truncate to w-1 visual columns then append ellipsis.
+                trunc, used = [], 0
+                for ch in cell:
+                    cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+                    if used + cw > w - 1:
+                        break
+                    trunc.append(ch)
+                    used += cw
+                cell = "".join(trunc) + "\u2026"
+            parts.append(" " + _vcljust(cell, w) + " ")
         return "  \u2502" + "\u2502".join(parts) + "\u2502"
 
     headers = [HDR_SRC, HDR_TGT, HDR_VIS]
@@ -4425,6 +5028,41 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
         key = f"{spec.namespace}/{spec.project}"
         (already_done if state.is_succeeded(key) else pending).append(spec)
 
+    # Validate checkpoint entries: a repo marked "succeeded" must actually exist on
+    # GitHub.  If it was deleted (or never landed) after the checkpoint was written,
+    # move it back to the pending list so it gets re-migrated this run.
+    if already_done:
+        log.info(
+            f"Verifying {len(already_done)} checkpoint-skipped repo(s) "
+            "against GitHub..."
+        )
+        _checkpoint_reinstated: list[RepoSpec] = []
+        for spec in already_done:
+            _org  = spec.target_org or config.github_default_org
+            _name = spec.target_name
+            _st, _ = client.request("GET", f"/repos/{_org}/{_name}")
+            if _st == 200:
+                pass  # confirmed present -- keep as skipped
+            elif _st == 404:
+                log.warning(
+                    f"[{_name}] Checkpoint says 'succeeded' but repo not found on "
+                    f"GitHub ({_org}/{_name}) -- reinstating for migration"
+                )
+                _checkpoint_reinstated.append(spec)
+            else:
+                log.warning(
+                    f"[{_name}] GitHub existence check returned HTTP {_st} -- "
+                    "treating as present (re-run if migration is needed)"
+                )
+        for spec in _checkpoint_reinstated:
+            already_done.remove(spec)
+            pending.append(spec)
+        if _checkpoint_reinstated:
+            log.info(
+                f"{len(_checkpoint_reinstated)} repo(s) reinstated to pending "
+                f"(not found on GitHub despite checkpoint entry)"
+            )
+
     if batch_size > 0 and len(pending) > batch_size:
         log.info(
             f"Batch mode: capping this run at {batch_size} repo(s) "
@@ -4441,6 +5079,7 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
             error="",
             duration_seconds=0.0,
             completed_at=_fmt_ts(),
+            skip_reason="checkpoint",
         )
         for s in already_done
     ]
@@ -4561,7 +5200,41 @@ def migrate_all(config: MigrationConfig, config_path: Path, repos_csv_path: Path
             + _c("(git ok; custom-props or CI skeleton failed)", 2)
         )  # bold bright-yellow count, dim explanation
     log.info(f"  \u274c  Failed     :  {_c(str(len(failed)),    1, 91)}")   # bold bright-red
-    log.info(f"  \u23ed\ufe0f  Skipped    :  {_c(str(len(skipped)),  2)}  {_c('(already done)', 2)}")  # dim
+    # Skipped -- break down by reason so the operator knows exactly why each repo was skipped.
+    if skipped:
+        _skip_checkpoint    = [r for r in skipped if r.skip_reason == "checkpoint"]
+        _skip_gh_exists     = [r for r in skipped if r.skip_reason == "gh_repo_exists"]
+        _skip_sync_diverged = [r for r in skipped if r.skip_reason == "sync_diverged"]
+        _skip_sync_no_repo  = [r for r in skipped if r.skip_reason == "sync_no_repo"]
+        _skip_other         = [
+            r for r in skipped
+            if r.skip_reason not in ("checkpoint", "gh_repo_exists", "sync_diverged", "sync_no_repo")
+        ]
+        log.info(f"  \u23ed\ufe0f  Skipped    :  {_c(str(len(skipped)), 2)}")
+        if _skip_checkpoint:
+            log.info(
+                _c(f"    \u251c\u2500 {len(_skip_checkpoint):>3}  checkpoint "
+                   "(previously migrated, confirmed on GitHub)", 2)
+            )
+        if _skip_gh_exists:
+            log.info(
+                _c(f"    \u251c\u2500 {len(_skip_gh_exists):>3}  GitHub repo already exists "
+                   "(delete from GitHub to re-migrate)", 2)
+            )
+        if _skip_sync_diverged:
+            log.info(
+                _c(f"    \u251c\u2500 {len(_skip_sync_diverged):>3}  sync_mode: diverged branch(es) "
+                   "detected -- manual resolution required", 2)
+            )
+        if _skip_sync_no_repo:
+            log.info(
+                _c(f"    \u251c\u2500 {len(_skip_sync_no_repo):>3}  sync_mode: GitHub repo not found "
+                   "(run initial migration first)", 2)
+            )
+        if _skip_other:
+            log.info(_c(f"    \u2514\u2500 {len(_skip_other):>3}  other", 2))
+    else:
+        log.info(f"  \u23ed\ufe0f  Skipped    :  {_c('0', 2)}")
     log.info(f"  \U0001f4ca  Success Rate:  {_c(success_rate, 1, 97)}")     # bold bright-white
     log.info(f"  \u23f1\ufe0f  Elapsed    :  {_c(_fmt_duration(elapsed), 1)}")
     # Custom properties summary
@@ -4674,7 +5347,8 @@ def _fetch_org_property_schema(client: GitHubClient, org: str) -> dict[str, str]
     try:
         status, body = client.request("GET", f"/orgs/{org}/properties/schema")
         if status != 200:
-            log.debug(f"Could not fetch property schema for org '{org}' (HTTP {status})")
+            log.warning(f"Could not fetch property schema for org '{org}' (HTTP {status}). "
+                        "Custom properties may fail due to type mismatches.")
             return {}
         entries: list[dict] = body if isinstance(body, list) else []
         return {
@@ -4683,7 +5357,8 @@ def _fetch_org_property_schema(client: GitHubClient, org: str) -> dict[str, str]
             if "property_name" in e
         }
     except Exception as exc:
-        log.debug(f"Property schema fetch for org '{org}' failed: {exc}")
+        log.warning(f"Property schema fetch for org '{org}' failed: {exc}. "
+                    "Custom properties may fail due to type mismatches.")
         return {}
 
 
@@ -4694,7 +5369,7 @@ _PROP_NULL_SENTINEL = "__null__"
 
 
 def _coerce_property_value(
-    raw: str,
+    raw: any,
     value_type: str,
     prop_name: str = "",
 ) -> "str | list[str] | None":
@@ -4714,24 +5389,31 @@ def _coerce_property_value(
     Returns None for the null sentinel so the caller can emit {"value": null}.
     Logs a warning for unrecognised value_type and falls back to plain string.
     """
-    if raw == _PROP_NULL_SENTINEL:
+    if raw is None or raw == _PROP_NULL_SENTINEL:
         return None
 
+    # ── Specific Type Coercion ─────────────────────────────────────────────────
+
     if value_type == "multi_select":
-        return [v.strip() for v in raw.split(";") if v.strip()]
+        if isinstance(raw, list):
+            return [str(v).strip() for v in raw if str(v).strip()]
+        raw_str = str(raw)
+        return [v.strip() for v in raw_str.split(";") if v.strip()]
 
     if value_type == "true_false":
-        normalised = raw.strip().lower()
+        if isinstance(raw, bool):
+            return "true" if raw else "false"
+        normalised = str(raw).strip().lower()
         if normalised not in ("true", "false"):
             log.warning(
                 f"Property '{prop_name}' (true_false): invalid value {raw!r}. "
                 "Expected 'true' or 'false'. Sending as-is; GitHub may reject with HTTP 422."
             )
-            return raw
+            return normalised
         return normalised
 
     if value_type == "url":
-        stripped = raw.strip()
+        stripped = str(raw).strip()
         if not (stripped.startswith("http://") or stripped.startswith("https://")):
             log.warning(
                 f"Property '{prop_name}' (url): value {raw!r} does not start with "
@@ -4739,14 +5421,25 @@ def _coerce_property_value(
             )
         return stripped
 
-    if value_type not in _GITHUB_PROPERTY_TYPES:
-        log.debug(
-            f"Property '{prop_name}': unknown value_type {value_type!r}. "
-            "Treating as string."
-        )
+    # ── Smart Fallback for "string" or unknown types ─────────────────────────────
+    # If the schema is missing (defaulting to "string"), we attempt to infer the type
+    # from the Python object to avoid common 422 errors (like sending "True" or "['a']").
 
-    # string, single_select, and unknown types: pass through as-is.
-    return raw
+    if isinstance(raw, bool):
+        return "true" if raw else "false"
+
+    if isinstance(raw, list):
+        return [str(v).strip() for v in raw if str(v).strip()]
+
+    raw_str = str(raw).strip()
+
+    if raw_str.lower() in ("true", "false"):
+        return raw_str.lower()
+
+    if ";" in raw_str:
+        return [v.strip() for v in raw_str.split(";") if v.strip()]
+
+    return raw_str
 
 
 def _validate_org_property_schema(
@@ -4763,6 +5456,28 @@ def _validate_org_property_schema(
         )
         return []
     return sorted(property_names - set(schema_map))
+
+
+def _get_current_repo_properties(
+    client: "GitHubClient",
+    org: str,
+    repo: str,
+) -> "dict[str, object]":
+    """Fetch current custom property values for a repo.
+
+    Returns a mapping of {property_name: value} as returned by the GitHub API
+    (strings, lists for multi_select, None for cleared properties).
+    Returns an empty dict on any API error so callers can safely fall through
+    to the PATCH path.
+    """
+    status, body = client.request("GET", f"/repos/{org}/{repo}/properties/values")
+    if status == 200 and isinstance(body, list):
+        return {
+            item["property_name"]: item["value"]
+            for item in body
+            if isinstance(item, dict) and "property_name" in item
+        }
+    return {}
 
 
 def _set_repo_properties(
@@ -4788,6 +5503,35 @@ def _set_repo_properties(
         k: _coerce_property_value(v, schema_map.get(k, "string"), prop_name=k)
         for k, v in properties.items()
     }
+
+    # ── GitHub-level idempotency check ──────────────────────────────────────
+    # Fetch the repo's current property values and compare against the desired
+    # coerced values.  If every desired key already has the correct value we
+    # skip the PATCH entirely -- no unnecessary API write, no spurious re-apply
+    # on re-runs of partial migrations.
+    #
+    # Comparison notes:
+    #   • multi_select: GitHub returns a list; we sort both sides so ["b","a"]
+    #     and ["a","b"] are treated as equal.
+    #   • null sentinel (__null__) coerces to None; GitHub returns None for
+    #     cleared properties -- compared directly.
+    #   • All other types (string, single_select, true_false, url) are plain
+    #     strings on both sides after coercion.
+    current_gh_props = _get_current_repo_properties(client, org, repo)
+    if current_gh_props:
+        def _props_equal(desired: object, current: object) -> bool:
+            if isinstance(desired, list) and isinstance(current, list):
+                return sorted(str(x) for x in desired) == sorted(str(x) for x in current)
+            return desired == current
+
+        if all(_props_equal(coerced.get(k), current_gh_props.get(k)) for k in coerced):
+            log.info(
+                f"[{label}] Custom properties already match GitHub values -- skipped: "
+                + ", ".join(f"{k}={coerced[k]!r}" for k in coerced)
+            )
+            return True, ""
+    # ────────────────────────────────────────────────────────────────────────
+
     payload = {
         "properties": [
             {"property_name": k, "value": v}  # None serialises to JSON null -- intentional
