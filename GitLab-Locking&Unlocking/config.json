@@ -1,0 +1,8 @@
+{
+    "gitlab": {
+        "url": "https://gitlab.com",
+        "token": "xxxxxxxxxxxxxxxxxxx",
+        "per_page": 100,
+        "verify_ssl": true
+    }
+}
