@@ -9,10 +9,12 @@
     }
   },
   "github": {
+    "api_url": "",
+    "url": "",
     "default_org": ""
   },
   "gitlab": {
-    "url": "https://gitlab.com",
+    "url": "",
     "pat": ""
   },
   "branches": {
@@ -21,17 +23,19 @@
     "exclude": []
   },
   "migration": {
-    "rename_default_branch_to_main": false,
+    "rename_default_branch_to_main": true,
     "max_workers": 5,
     "clone_timeout_seconds": 7200,
     "push_timeout_seconds": 7200,
     "git_retry_count": 3,
     "dry_run": false,
+    "sync_mode": false,
+    "local_clone_dir": "local-clones",
     "min_free_disk_gb": 10,
     "git_http_post_buffer_bytes": 524288000,
     "git_push_batch_size": 100,
     "lfs_enabled": false,
-    "detailed_commit_count": false,
+    "detailed_commit_count": true,
     "check_oversized_files": true
   },
   "ci_skeleton": {
@@ -39,27 +43,31 @@
     "enabled": true,
     "templates_dir": "ci-templates",
     "target_path": ".github/workflows",
-    "commit_message": "chore: add CI skeleton workflow [migration]",
-    "branches": ["main", "master", "develop"],
+    "commit_message": "add CI skeleton workflow [migration]",
+    "branches": [
+      "main",
+      "master",
+      "develop"
+    ],
     "skip_if_exists": true
   },
   "notification": {
     "enabled": false,
     "smtp_host": "smtp.example.com",
     "smtp_port": 587,
-    "_comment_tls": "use_tls=true with port 587 (STARTTLS, recommended). Use use_ssl=true with port 465 for implicit TLS. Both false = plain SMTP (internal relay only).",
     "use_tls": true,
     "use_ssl": false,
     "smtp_user": "migrations@example.com",
     "smtp_password": "YOUR_SMTP_PASSWORD",
     "from": "migrations@example.com",
-    "to": ["team@example.com", "manager@example.com"],
+    "to": [
+      "team@example.com",
+      "manager@example.com"
+    ],
     "cc": [],
     "subject_prefix": "[GitMigration]",
     "attach_report": true,
     "attach_log_tail_lines": 200,
     "smtp_timeout_seconds": 30
   }
-}
-
 }
