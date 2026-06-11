@@ -1646,9 +1646,9 @@ def _filter_branches(
     default = _get_default_branch(mirror_dir)
     kept = list(branches)
     if include_patterns:
-        kept = [b for b in kept if any(re.search(p, b) for p in include_patterns)]
+        kept = [b for b in kept if any(re.fullmatch(p, b) for p in include_patterns)]
     if exclude_patterns:
-        kept = [b for b in kept if not any(re.search(p, b) for p in exclude_patterns)]
+        kept = [b for b in kept if not any(re.fullmatch(p, b) for p in exclude_patterns)]
 
     # Always preserve the default branch regardless of filter outcome.
     if default and default not in kept:
@@ -4297,7 +4297,7 @@ def _write_xlsx(
         "Source (GitLab)", "Target (GitHub)", "GitHub URL",
         "Status", "Visibility", "Default Branch", "Renamed to main",
         "Branches Pushed", "Tags Pushed", "LFS Detected", "LFS Objects",
-        "Custom Props Status", "Custom Props Applied", "Custom Props Error",
+        "Custom Props Status", "Custom Props Error",
         "CI Skeleton", "CI Branches Created", "CI Branches Skipped", "CI Error",
         "Delta Branches Pushed", "Delta Tags Pushed", "Diverged Branches",
         "Duration", "Completed At", "Git Error",
@@ -4318,10 +4318,6 @@ def _write_xlsx(
             _fill("FFC7CE") if r.ci_skeleton_status == "failed" else
             rf
         )
-        _cp_applied_str = (
-            ", ".join(f"{k}={v!r}" for k, v in r.custom_properties_applied.items())
-            if r.custom_properties_applied else ""
-        )
         vals = [
             r.source, r.target, None,
             r.status,
@@ -4333,7 +4329,6 @@ def _write_xlsx(
             "Yes" if r.lfs_detected else ("No" if r.status in ("succeeded", "partial") else ""),
             r.lfs_object_count if r.lfs_detected else "",
             r.custom_properties_status or "",
-            _cp_applied_str,
             r.custom_properties_error or "",
             r.ci_skeleton_status or "",
             "; ".join(r.ci_skeleton_branches_created) if r.ci_skeleton_branches_created else "",
@@ -4346,12 +4341,12 @@ def _write_xlsx(
             r.completed_at,
             r.error or "",
         ]
-        # Columns that should wrap: Custom Props Applied(13), CP Error(14), CI Error(18),
-        # Delta Branches(19), Delta Tags(20), Diverged Branches(21), Git Error(24)
-        _wrap_cols_repos = {13, 14, 18, 19, 20, 21, 24}
-        # Column fill: cp cols 12-14 use cp_fill; ci cols 15-18 use ci_fill; rest use rf
-        _cp_cols  = {12, 13, 14}
-        _ci_cols  = {15, 16, 17, 18}
+        # Columns that should wrap: CP Error(13), CI Error(17),
+        # Delta Branches(18), Delta Tags(19), Diverged Branches(20), Git Error(23)
+        _wrap_cols_repos = {13, 17, 18, 19, 20, 23}
+        # Column fill: cp cols 12-13 use cp_fill; ci cols 14-17 use ci_fill; rest use rf
+        _cp_cols  = {12, 13}
+        _ci_cols  = {14, 15, 16, 17}
         for ci, val in enumerate(vals, 1):
             if ci == 3:
                 if r.gh_repo_url:
@@ -4361,7 +4356,7 @@ def _write_xlsx(
             c = ws_repos.cell(row=ri, column=ci, value=val)
             c.fill = cp_fill if ci in _cp_cols else ci_fill if ci in _ci_cols else rf
             c.alignment = WRAP if ci in _wrap_cols_repos else LEFT
-    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 14, 12, 12, 12, 18, 42, 40, 14, 30, 30, 40, 35, 25, 35, 16, 22, 45])
+    _col_widths(ws_repos, [42, 38, 52, 12, 12, 18, 16, 14, 12, 12, 12, 18, 40, 14, 30, 30, 40, 35, 25, 35, 16, 22, 45])
 
     # =========================================================================
     # Sheet 3: Failed & Mismatches (engineers -- actionable only)
