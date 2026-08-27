@@ -1,0 +1,17 @@
+{
+  "gitlab_url": "https://gitlab.com",
+  "private_token": "",
+  "size_threshold_mb": 100,
+  "output_format": "excel",
+  "output_file": "large_files_report",
+  "branches_to_scan": [],
+  "scan_all_branches": true,
+  "default_branch_only": false,
+  "request_timeout_seconds": 30,
+  "max_retries": 3,
+  "retry_delay_seconds": 2,
+  "log_level": "INFO",
+  "log_file": "gitlab_scanner.log",
+  "concurrent_workers": 4,
+  "per_page": 100
+}
