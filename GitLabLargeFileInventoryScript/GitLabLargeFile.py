@@ -37,11 +37,12 @@ def _ensure_packages() -> None:
 _ensure_packages()
 # ---------------------------------------------------------------------------
 
+import base64
 import csv
 import json
 import logging
-import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -50,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import requests.adapters
 
 # ---------------------------------------------------------------------------
 # Optional dependency: openpyxl (for Excel output)
@@ -87,6 +89,9 @@ REPORT_HEADERS = [
     "File URL",
     "Scanned At",
 ]
+
+# Files smaller than this are checked for LFS pointer content via GET
+_LFS_CANDIDATE_THRESHOLD = 1024
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -149,7 +154,10 @@ def load_config(path: Path) -> Dict[str, Any]:
     cfg.setdefault("retry_delay_seconds", 2)
     cfg.setdefault("log_level", "INFO")
     cfg.setdefault("log_file", "gitlab_scanner.log")
-    cfg.setdefault("concurrent_workers", 4)
+    cfg.setdefault("concurrent_workers", 2)           # repos in parallel
+    cfg.setdefault("branch_workers", 5)               # branches per repo in parallel
+    cfg.setdefault("file_workers", 16)                # file probes per branch in parallel
+    cfg.setdefault("max_concurrent_requests", 20)     # total in-flight HTTP calls
     cfg.setdefault("per_page", 100)
 
     return cfg
@@ -197,97 +205,115 @@ def load_repos(path: Path) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 class GitLabClient:
-    """Thin wrapper around the GitLab REST API v4."""
+    """
+    Thread-safe GitLab REST API v4 client.
 
-    def __init__(self, cfg: Dict[str, Any], logger: logging.Logger):
+    Key optimisations:
+    - HEAD requests for file size: reads X-Gitlab-Size + X-Gitlab-Last-Commit-Id
+      headers without downloading base64 content.
+    - Blob SHA cache: identical blobs on different branches are probed once.
+    - Semaphore caps total concurrent in-flight HTTP calls.
+    - Properly-sized urllib3 connection pool.
+    - Exponential back-off with semaphore released during sleep.
+    """
+
+    def __init__(self, cfg: Dict[str, Any], logger: logging.Logger) -> None:
         self.base_url = cfg["gitlab_url"].rstrip("/") + "/api/v4"
-        self.session = requests.Session()
-        self.session.headers.update({"PRIVATE-TOKEN": cfg["private_token"]})
         self.timeout = cfg["request_timeout_seconds"]
         self.max_retries = cfg["max_retries"]
         self.retry_delay = cfg["retry_delay_seconds"]
         self.per_page = cfg["per_page"]
         self.logger = logger
 
+        max_conn = cfg.get("max_concurrent_requests", 20)
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=max_conn,
+            pool_maxsize=max_conn * 2,
+            max_retries=0,
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers.update({"PRIVATE-TOKEN": cfg["private_token"]})
+
+        # Caps total concurrent in-flight HTTP calls across all worker threads.
+        self._semaphore = threading.Semaphore(max_conn)
+
+        # blob_sha -> size_bytes; prevents re-fetching the same blob on multiple branches.
+        self._blob_size_cache: Dict[str, int] = {}
+        self._cache_lock = threading.Lock()
+
     # ------------------------------------------------------------------
-    # Low-level helpers
+    # Core HTTP execution
+    # ------------------------------------------------------------------
+
+    def _execute(self, method: str, url: str, params: Optional[Dict] = None) -> requests.Response:
+        """Single HTTP call with semaphore + exponential back-off retry."""
+        params = params or {}
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                with self._semaphore:
+                    resp = self.session.request(method, url, params=params, timeout=self.timeout)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                if attempt < self.max_retries:
+                    delay = self.retry_delay * (2 ** (attempt - 1))
+                    self.logger.warning(
+                        "Network error attempt %d/%d for %s: %s — retry in %.0fs.",
+                        attempt, self.max_retries, url, exc, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+
+            if resp.status_code == 429:
+                if attempt < self.max_retries:
+                    wait = int(resp.headers.get("Retry-After", self.retry_delay * (2 ** attempt)))
+                    self.logger.warning(
+                        "Rate limited (attempt %d/%d). Waiting %ds.", attempt, self.max_retries, wait
+                    )
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+
+            return resp
+
+        raise RuntimeError(f"Exhausted {self.max_retries} retries for {url}")
+
+    # ------------------------------------------------------------------
+    # Public request helpers
     # ------------------------------------------------------------------
 
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
-        """GET with retry logic. Returns parsed JSON."""
-        url = f"{self.base_url}{endpoint}"
-        params = params or {}
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", self.retry_delay * attempt))
-                    self.logger.warning("Rate limited. Waiting %ds before retry …", retry_after)
-                    time.sleep(retry_after)
-                    continue
-
-                resp.raise_for_status()
-                return resp.json()
-
-            except requests.exceptions.RequestException as exc:
-                self.logger.warning(
-                    "Attempt %d/%d failed for %s: %s", attempt, self.max_retries, url, exc
-                )
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_delay * attempt)
-                else:
-                    raise
+        resp = self._execute("GET", f"{self.base_url}{endpoint}", params)
+        resp.raise_for_status()
+        return resp.json()
 
     def _get_paginated(self, endpoint: str, params: Optional[Dict] = None) -> List[Any]:
-        """Follow GitLab pagination and return all items."""
         params = dict(params or {})
         params["per_page"] = self.per_page
-        page = 1
+        url = f"{self.base_url}{endpoint}"
         items: List[Any] = []
+        page = 1
 
         while True:
             params["page"] = page
-            url = f"{self.base_url}{endpoint}"
+            resp = self._execute("GET", url, params)
+            resp.raise_for_status()
+            batch: List[Any] = resp.json()
+            if not batch:
+                break
+            items.extend(batch)
+            if page >= int(resp.headers.get("X-Total-Pages", 1)):
+                break
+            page += 1
 
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    resp = self.session.get(url, params=params, timeout=self.timeout)
-
-                    if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", self.retry_delay * attempt))
-                        self.logger.warning("Rate limited. Waiting %ds …", retry_after)
-                        time.sleep(retry_after)
-                        continue
-
-                    resp.raise_for_status()
-                    batch = resp.json()
-                    items.extend(batch)
-
-                    total_pages = int(resp.headers.get("X-Total-Pages", 1))
-                    if page >= total_pages or not batch:
-                        return items
-                    page += 1
-                    break  # success → next page
-
-                except requests.exceptions.RequestException as exc:
-                    self.logger.warning(
-                        "Attempt %d/%d failed for %s: %s", attempt, self.max_retries, url, exc
-                    )
-                    if attempt < self.max_retries:
-                        time.sleep(self.retry_delay * attempt)
-                    else:
-                        raise
-
-        return items  # unreachable but satisfies type checkers
+        return items
 
     # ------------------------------------------------------------------
     # Domain helpers
     # ------------------------------------------------------------------
 
     def get_project(self, repo_path: str) -> Optional[Dict]:
-        """Fetch project metadata. Returns None if not found."""
         encoded = requests.utils.quote(repo_path, safe="")
         try:
             return self._get(f"/projects/{encoded}")
@@ -297,36 +323,179 @@ class GitLabClient:
             raise
 
     def get_branches(self, project_id: int) -> List[str]:
-        """Return list of branch names for a project."""
-        branches = self._get_paginated(f"/projects/{project_id}/repository/branches")
-        return [b["name"] for b in branches]
-
-    def get_tree(self, project_id: int, branch: str, path: str = "", recursive: bool = True) -> List[Dict]:
-        """Return repository tree items (files + dirs)."""
-        return self._get_paginated(
-            f"/projects/{project_id}/repository/tree",
-            params={"ref": branch, "path": path, "recursive": recursive},
-        )
+        return [b["name"] for b in self._get_paginated(f"/projects/{project_id}/repository/branches")]
 
     def get_blobs(self, project_id: int, branch: str) -> List[Dict]:
-        """Return only blob (file) entries from the full recursive tree."""
-        tree = self.get_tree(project_id, branch, recursive=True)
+        tree = self._get_paginated(
+            f"/projects/{project_id}/repository/tree",
+            params={"ref": branch, "recursive": True},
+        )
         return [item for item in tree if item.get("type") == "blob"]
 
-    def get_file_metadata(self, project_id: int, file_path: str, branch: str) -> Optional[Dict]:
+    # ------------------------------------------------------------------
+    # File size probing (hot path)
+    # ------------------------------------------------------------------
+
+    def probe_file_size(
+        self,
+        project_id: int,
+        file_path: str,
+        branch: str,
+        blob_sha: str,
+        threshold_bytes: int,
+    ) -> Optional[Tuple[int, str]]:
         """
-        Fetch file metadata including size.
-        Uses the repository/files endpoint which returns size without downloading content.
+        Return (size_bytes, last_commit_id) if size >= threshold, else None.
+
+        Strategy (fastest to slowest):
+          1. Blob SHA cache hit  — zero API calls.
+          2. HEAD /repository/files — reads X-Gitlab-Size + X-Gitlab-Last-Commit-Id
+             headers without downloading any file content.
+          3. Full GET — only for files < 1 KB (potential LFS pointer) or when
+             HEAD is unavailable/fails on the server.
         """
-        encoded_path = requests.utils.quote(file_path, safe="")
+        # 1. Cache check (blob SHA is content-addressed; same SHA == same size).
+        if blob_sha:
+            with self._cache_lock:
+                cached = self._blob_size_cache.get(blob_sha)
+            if cached is not None:
+                if cached < threshold_bytes:
+                    return None
+                # Large blob in cache; still need per-branch commit ID via HEAD.
+                commit_id = self._head_commit_id(project_id, file_path, branch)
+                return cached, commit_id
+
+        # 2. HEAD request — no content download.
+        encoded = requests.utils.quote(file_path, safe="")
+        url = f"{self.base_url}/projects/{project_id}/repository/files/{encoded}"
+        try:
+            resp = self._execute("HEAD", url, {"ref": branch})
+        except requests.exceptions.RequestException as exc:
+            self.logger.debug("HEAD failed for %s@%s (%s); falling back to GET.", file_path, branch, exc)
+            return self._probe_via_get(project_id, file_path, branch, blob_sha, threshold_bytes)
+
+        if resp.status_code == 404:
+            return None
+        if resp.status_code in (405, 501):
+            return self._probe_via_get(project_id, file_path, branch, blob_sha, threshold_bytes)
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            return self._probe_via_get(project_id, file_path, branch, blob_sha, threshold_bytes)
+
+        size_str = resp.headers.get("X-Gitlab-Size", "")
+        if not size_str:
+            return self._probe_via_get(project_id, file_path, branch, blob_sha, threshold_bytes)
+
+        size_bytes = int(size_str)
+        last_commit = (
+            resp.headers.get("X-Gitlab-Last-Commit-Id")
+            or resp.headers.get("X-Gitlab-Commit-Id")
+            or ""
+        )
+
+        if blob_sha:
+            with self._cache_lock:
+                self._blob_size_cache[blob_sha] = size_bytes
+
+        # 3. LFS pointer candidate: git object is tiny but may reference a huge object.
+        if size_bytes < _LFS_CANDIDATE_THRESHOLD:
+            return self._resolve_lfs(project_id, file_path, branch, blob_sha, threshold_bytes, last_commit)
+
+        return (size_bytes, last_commit) if size_bytes >= threshold_bytes else None
+
+    def _head_commit_id(self, project_id: int, file_path: str, branch: str) -> str:
+        """Lightweight HEAD to fetch last_commit_id for a blob already in cache."""
+        encoded = requests.utils.quote(file_path, safe="")
+        url = f"{self.base_url}/projects/{project_id}/repository/files/{encoded}"
+        try:
+            resp = self._execute("HEAD", url, {"ref": branch})
+            if resp.ok:
+                return (
+                    resp.headers.get("X-Gitlab-Last-Commit-Id")
+                    or resp.headers.get("X-Gitlab-Commit-Id")
+                    or ""
+                )
+        except Exception:
+            pass
+        return ""
+
+    def _resolve_lfs(
+        self,
+        project_id: int,
+        file_path: str,
+        branch: str,
+        blob_sha: str,
+        threshold_bytes: int,
+        fallback_commit: str,
+    ) -> Optional[Tuple[int, str]]:
+        """GET the file and parse the LFS pointer to obtain the actual object size."""
+        meta = self._get_file_raw(project_id, file_path, branch)
+        if meta is None:
+            return None
+
+        size_bytes: int = meta.get("size", 0)
+        last_commit: str = meta.get("last_commit_id", fallback_commit)
+
+        if size_bytes < _LFS_CANDIDATE_THRESHOLD and meta.get("encoding") == "base64":
+            try:
+                content = base64.b64decode(meta.get("content", "")).decode("utf-8", errors="replace")
+                if content.startswith("version https://git-lfs.github.com/spec/"):
+                    for line in content.splitlines():
+                        if line.startswith("size "):
+                            size_bytes = int(line.split(" ", 1)[1])
+                            break
+            except Exception:
+                pass
+
+        if blob_sha:
+            with self._cache_lock:
+                self._blob_size_cache[blob_sha] = size_bytes
+
+        return (size_bytes, last_commit) if size_bytes >= threshold_bytes else None
+
+    def _probe_via_get(
+        self,
+        project_id: int,
+        file_path: str,
+        branch: str,
+        blob_sha: str,
+        threshold_bytes: int,
+    ) -> Optional[Tuple[int, str]]:
+        """Full GET fallback: handles both regular files and LFS pointers."""
+        meta = self._get_file_raw(project_id, file_path, branch)
+        if meta is None:
+            return None
+
+        size_bytes: int = meta.get("size", 0)
+        last_commit: str = meta.get("last_commit_id", "")
+
+        if size_bytes < _LFS_CANDIDATE_THRESHOLD and meta.get("encoding") == "base64":
+            try:
+                content = base64.b64decode(meta.get("content", "")).decode("utf-8", errors="replace")
+                if content.startswith("version https://git-lfs.github.com/spec/"):
+                    for line in content.splitlines():
+                        if line.startswith("size "):
+                            size_bytes = int(line.split(" ", 1)[1])
+                            break
+            except Exception:
+                pass
+
+        if blob_sha:
+            with self._cache_lock:
+                self._blob_size_cache[blob_sha] = size_bytes
+
+        return (size_bytes, last_commit) if size_bytes >= threshold_bytes else None
+
+    def _get_file_raw(self, project_id: int, file_path: str, branch: str) -> Optional[Dict]:
+        encoded = requests.utils.quote(file_path, safe="")
         try:
             return self._get(
-                f"/projects/{project_id}/repository/files/{encoded_path}",
+                f"/projects/{project_id}/repository/files/{encoded}",
                 params={"ref": branch},
             )
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
-                self.logger.debug("File not found: %s @ %s", file_path, branch)
                 return None
             raise
 
@@ -362,94 +531,83 @@ def scan_branch(
     repo_path: str,
     branch: str,
     threshold_bytes: int,
+    file_workers: int,
     scanned_at: str,
     logger: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """Scan a single branch and return rows for large files."""
-    project_id = project_info["id"]
-    repo_name = project_info["name"]
-    web_url = project_info.get("web_url", "")
+    """Scan a single branch. File probing is parallelised across file_workers threads."""
+    project_id: int = project_info["id"]
+    repo_name: str = project_info["name"]
+    web_url: str = project_info.get("web_url", "")
 
     logger.info("    Scanning branch: %s", branch)
 
     try:
         blobs = client.get_blobs(project_id, branch)
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("    Failed to fetch tree for branch '%s': %s", branch, exc)
+    except Exception as exc:
+        logger.error("    Could not fetch tree for branch '%s': %s", branch, exc)
         return []
 
-    logger.info("    Found %d file(s) in tree. Checking sizes …", len(blobs))
+    total = len(blobs)
+    logger.info("    Branch '%s' — %d file(s) in tree. Probing sizes …", branch, total)
 
     large_files: List[Dict[str, Any]] = []
-    checked = 0
+    results_lock = threading.Lock()
+    checked_count = [0]
 
-    for blob in blobs:
+    def probe(blob: Dict) -> None:
         file_path: str = blob.get("path", "")
+        blob_sha: str = blob.get("id", "")
         if not file_path:
-            continue
+            return
 
         try:
-            meta = client.get_file_metadata(project_id, file_path, branch)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.debug("    Skipping %s: %s", file_path, exc)
-            continue
+            result = client.probe_file_size(project_id, file_path, branch, blob_sha, threshold_bytes)
+        except Exception as exc:
+            logger.debug("    Skipping %s@%s: %s", file_path, branch, exc)
+            return
 
-        if meta is None:
-            continue
+        with results_lock:
+            checked_count[0] += 1
+            done = checked_count[0]
 
-        size_bytes: int = meta.get("size", 0)
-        
-        # Check if it might be a Git LFS pointer
-        if size_bytes < 1024 and meta.get("encoding") == "base64":
-            import base64
-            try:
-                content = base64.b64decode(meta.get("content", "")).decode("utf-8")
-                if content.startswith("version https://git-lfs.github.com/spec/"):
-                    for line in content.splitlines():
-                        if line.startswith("size "):
-                            size_bytes = int(line.split(" ")[1])
-                            break
-            except Exception as exc:
-                logger.debug("    Failed to parse potential LFS pointer %s: %s", file_path, exc)
+        if done % 100 == 0 or done == total:
+            logger.info("    [%s] Progress: %d/%d files checked.", branch, done, total)
 
-        checked += 1
+        if result is None:
+            return
 
-        if size_bytes >= threshold_bytes:
-            file_name = Path(file_path).name
-            folder_path = str(Path(file_path).parent)
-            if folder_path == ".":
-                folder_path = "(root)"
+        size_bytes, last_commit = result
+        folder_path = str(Path(file_path).parent)
+        if folder_path == ".":
+            folder_path = "(root)"
 
-            size_mb = round(size_bytes / (1024 * 1024), 3)
-            last_commit = meta.get("last_commit_id", "")
-            file_url = f"{web_url}/-/blob/{branch}/{file_path}"
+        row: Dict[str, Any] = {
+            "Org / Group Name": org_name,
+            "Repository Name": repo_name,
+            "Repository Path": repo_path,
+            "Branch Name": branch,
+            "File Path": file_path,
+            "Folder Path": folder_path,
+            "File Name": Path(file_path).name,
+            "File Size (MB)": round(size_bytes / (1024 * 1024), 3),
+            "File Size (Bytes)": size_bytes,
+            "Last Commit ID": last_commit,
+            "File URL": f"{web_url}/-/blob/{branch}/{file_path}",
+            "Scanned At": scanned_at,
+        }
 
-            row = {
-                "Org / Group Name": org_name,
-                "Repository Name": repo_name,
-                "Repository Path": repo_path,
-                "Branch Name": branch,
-                "File Path": file_path,
-                "Folder Path": folder_path,
-                "File Name": file_name,
-                "File Size (MB)": size_mb,
-                "File Size (Bytes)": size_bytes,
-                "Last Commit ID": last_commit,
-                "File URL": file_url,
-                "Scanned At": scanned_at,
-            }
+        with results_lock:
             large_files.append(row)
-            logger.info(
-                "    * Large file: %s  (%.2f MB)",
-                file_path,
-                size_mb,
-            )
+            logger.info("    * Large file: %s  (%.2f MB)", file_path, row["File Size (MB)"])
+
+    with ThreadPoolExecutor(
+        max_workers=file_workers, thread_name_prefix=f"file-{branch[:20]}"
+    ) as ex:
+        list(ex.map(probe, blobs))
 
     logger.info(
-        "    Branch '%s' — checked %d file(s), %d large file(s) found.",
-        branch,
-        checked,
-        len(large_files),
+        "    Branch '%s' done — %d large file(s) found.", branch, len(large_files)
     )
     return large_files
 
@@ -462,29 +620,44 @@ def scan_repo(
     scanned_at: str,
     logger: logging.Logger,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Scan all configured branches of a single repo. Returns (repo_path, rows)."""
+    """Scan all configured branches of one repo. Branches are scanned in parallel."""
     threshold_bytes = int(cfg["size_threshold_mb"] * 1024 * 1024)
-    all_rows: List[Dict[str, Any]] = []
+    branch_workers: int = cfg.get("branch_workers", 5)
+    file_workers: int = cfg.get("file_workers", 16)
 
     logger.info("Scanning repo: %s", repo_path)
 
     project = client.get_project(repo_path)
     if project is None:
-        logger.warning("  Repo not found or no access: %s. Skipping.", repo_path)
+        logger.warning("  Repo not found or no access: %s — skipping.", repo_path)
         return repo_path, []
 
     default_branch: str = project.get("default_branch") or "main"
     branches = determine_branches(client, project["id"], default_branch, cfg, logger)
 
-    for branch in branches:
-        rows = scan_branch(
-            client, project, org_name, repo_path, branch, threshold_bytes, scanned_at, logger
-        )
-        all_rows.extend(rows)
+    all_rows: List[Dict[str, Any]] = []
+    rows_lock = threading.Lock()
 
-    logger.info(
-        "Finished repo: %s — total large files found: %d", repo_path, len(all_rows)
-    )
+    def scan_one(branch: str) -> None:
+        rows = scan_branch(
+            client, project, org_name, repo_path, branch,
+            threshold_bytes, file_workers, scanned_at, logger,
+        )
+        with rows_lock:
+            all_rows.extend(rows)
+
+    with ThreadPoolExecutor(
+        max_workers=min(branch_workers, len(branches)),
+        thread_name_prefix="branch",
+    ) as ex:
+        futures = {ex.submit(scan_one, b): b for b in branches}
+        for future in as_completed(futures):
+            branch = futures[future]
+            exc = future.exception()
+            if exc:
+                logger.error("  Branch '%s' raised: %s", branch, exc, exc_info=exc)
+
+    logger.info("Finished repo: %s — total large files: %d", repo_path, len(all_rows))
     return repo_path, all_rows
 
 
@@ -611,11 +784,15 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("GitLab Large File Inventory Script")
     logger.info("=" * 70)
-    logger.info("GitLab URL     : %s", cfg["gitlab_url"])
-    logger.info("Size Threshold : %s MB", cfg["size_threshold_mb"])
-    logger.info("Output Format  : %s", cfg["output_format"])
-    logger.info("Config file    : %s", CONFIG_FILE)
-    logger.info("Repos file     : %s", REPOS_FILE)
+    logger.info("GitLab URL            : %s", cfg["gitlab_url"])
+    logger.info("Size Threshold        : %s MB", cfg["size_threshold_mb"])
+    logger.info("Concurrent repos      : %s", cfg["concurrent_workers"])
+    logger.info("Branch workers        : %s", cfg["branch_workers"])
+    logger.info("File workers          : %s", cfg["file_workers"])
+    logger.info("Max concurrent reqs   : %s", cfg["max_concurrent_requests"])
+    logger.info("Output format         : %s", cfg["output_format"])
+    logger.info("Config file           : %s", CONFIG_FILE)
+    logger.info("Repos file            : %s", REPOS_FILE)
     logger.info("=" * 70)
 
     # -- Load repos
