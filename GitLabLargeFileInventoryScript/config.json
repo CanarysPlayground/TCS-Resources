@@ -12,6 +12,9 @@
   "retry_delay_seconds": 2,
   "log_level": "INFO",
   "log_file": "gitlab_scanner.log",
-  "concurrent_workers": 4,
+  "concurrent_workers": 2,
+  "branch_workers": 5,
+  "file_workers": 16,
+  "max_concurrent_requests": 20,
   "per_page": 100
 }
