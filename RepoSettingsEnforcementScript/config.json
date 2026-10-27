@@ -1,0 +1,24 @@
+{
+  "github_app": {
+    "app_id": ,
+    "private_key_path": ".pem",
+    "installation_id": 
+  },
+  "auth_token": "",
+  "organization": "",
+  "default_ruleset_ids": [],
+  "api_base_url": "https://api.<subdomain>.ghe.com",
+  "actions_policy": {
+    "enabled": true,
+    "allowed_actions": "all"
+  },
+  "rate_limit": {
+    "max_retries": 5,
+    "min_remaining_threshold": 15,
+    "backoff_factor_seconds": 5
+  },
+  "reporting": {
+    "excel_report_path": "enforcement_report.xlsx",
+    "csv_report_path": "enforcement_report.csv"
+  }
+}
