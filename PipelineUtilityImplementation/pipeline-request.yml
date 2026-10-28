@@ -1,0 +1,68 @@
+name: Pipeline Request
+description: Request CI/CD pipeline provisioning
+title: "[Pipeline Request] "
+body:
+
+  - type: input
+    id: repository
+    attributes:
+      label: Target Repository
+      description: Enter the repository where the pipeline should be provisioned.
+      placeholder: "example: payment-service"
+    validations:
+      required: true
+
+  - type: input
+    id: release_version
+    attributes:
+      label: Release Version
+      description: Enter the release version for branch creation.
+      placeholder: "example: 1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tech_stack
+    attributes:
+      label: Technology Stack
+      description: Select the application technology.
+      options:
+        - Node.js
+        - Java
+        - Python
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build_tool
+    attributes:
+      label: Build Tool
+      description: Select the build tool.
+      options:
+        - npm
+        - Maven
+        - Gradle
+        - pip
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: security_scans
+    attributes:
+      label: Security Scans
+      description: Select the scans required in the pipeline.
+      options:
+        - label: SAST
+        - label: SonarQube
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      description: Select the deployment target.
+      options:
+        - No Deployement
+        - Kubernetes
+        - Azure VM
+    validations:
+      required: true

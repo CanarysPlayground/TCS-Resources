@@ -1,0 +1,355 @@
+#checking
+name: Pipeline Generator
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  process-pipeline-request:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout the pipeline utility repository
+      - name: Checkout Pipeline Utility
+        uses: actions/checkout@v4
+
+      # 2. Parse issue data and validate inputs
+      - name: Parse Issue Data
+        id: parse
+        shell: bash
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import re
+
+          body = os.environ.get("ISSUE_BODY", "")
+          lines = body.splitlines()
+
+          def get_value(section):
+              target = f"### {section}".strip().lower()
+
+              for i, line in enumerate(lines):
+                  if line.strip().lower() == target:
+                      for next_line in lines[i + 1:]:
+                          value = next_line.strip()
+
+                          if value.startswith("### "):
+                              break
+
+                          if value:
+                              return value
+
+              return ""
+
+          target_repo = get_value("Target Repository")
+          release_version = get_value("Release Version")
+          tech_stack = get_value("Technology Stack")
+          build_tool = get_value("Build Tool")
+          deployment = get_value("Deployment")
+
+          if not target_repo:
+              raise ValueError("Target Repository is required.")
+
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+", target_repo):
+              raise ValueError("Target Repository must be a repository name, not a URL or owner/repo path.")
+
+          if not release_version:
+              raise ValueError("Release Version is required.")
+
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", release_version):
+              raise ValueError("Release Version contains invalid characters.")
+
+          if not tech_stack:
+              raise ValueError("Technology Stack is required.")
+
+          sast = bool(re.search(r"(?im)^\s*-\s*\[[xX]\]\s*SAST\s*$", body))
+          sonarqube = bool(re.search(r"(?im)^\s*-\s*\[[xX]\]\s*SonarQube\s*$", body))
+
+          values = {
+              "target_repo": target_repo,
+              "release_version": release_version,
+              "tech_stack": tech_stack,
+              "build_tool": build_tool,
+              "sast": str(sast).lower(),
+              "sonarqube": str(sonarqube).lower(),
+              "deployment": deployment,
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              for key, value in values.items():
+                  if "\n" in value or "\r" in value:
+                      raise ValueError(f"Invalid newline in {key}.")
+                  f.write(f"{key}={value}\n")
+          PY
+
+      # 3. Display parsed request
+      - name: Display Parsed Data
+        env:
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          RELEASE_VERSION: ${{ steps.parse.outputs.release_version }}
+          TECH_STACK: ${{ steps.parse.outputs.tech_stack }}
+          BUILD_TOOL: ${{ steps.parse.outputs.build_tool }}
+          SAST: ${{ steps.parse.outputs.sast }}
+          SONARQUBE: ${{ steps.parse.outputs.sonarqube }}
+          DEPLOYMENT: ${{ steps.parse.outputs.deployment }}
+        run: |
+          echo "Target Repository: ${TARGET_REPO}"
+          echo "Release Version: ${RELEASE_VERSION}"
+          echo "Technology Stack: ${TECH_STACK}"
+          echo "Build Tool: ${BUILD_TOOL}"
+          echo "SAST: ${SAST}"
+          echo "SonarQube: ${SONARQUBE}"
+          echo "Deployment: ${DEPLOYMENT}"
+
+      # 4. Select the existing Node.js template
+      - name: Select Pipeline Template
+        id: template
+        env:
+          TECH_STACK: ${{ steps.parse.outputs.tech_stack }}
+        run: |
+          set -euo pipefail
+
+          case "${TECH_STACK}" in
+            "Node.js")
+              TEMPLATE_PATH="templates/nodejs/build.yml"
+              ;;
+            *)
+              echo "::error::Unsupported technology stack: ${TECH_STACK}"
+              exit 1
+              ;;
+          esac
+
+          if [ ! -f "${TEMPLATE_PATH}" ]; then
+            echo "::error::Template not found: ${TEMPLATE_PATH}"
+            exit 1
+          fi
+
+          echo "Selected template: ${TEMPLATE_PATH}"
+          echo "template_path=${TEMPLATE_PATH}" >> "$GITHUB_OUTPUT"
+
+      # 5. Prepare the existing Node.js pipeline
+      - name: Prepare Generated Pipeline
+        env:
+          TEMPLATE_PATH: ${{ steps.template.outputs.template_path }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p generated/.github/workflows
+          cp "${TEMPLATE_PATH}" generated/.github/workflows/build.yml
+
+          echo "Generated files:"
+          find generated -type f
+
+      # 6. Create a GitHub App token for the requested target repository
+      - name: Create GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.parse.outputs.target_repo }}
+          permission-contents: write
+          permission-workflows: write
+
+      # 7. Verify target repository access
+      - name: Test Target Repository Access
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          REPO="${OWNER}/${TARGET_REPO}"
+
+          echo "Testing access to ${REPO}..."
+          gh api "repos/${REPO}" --jq '.full_name'
+
+          echo "Checking that main exists..."
+          gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha'
+
+      # 8. Create branches from main
+      - name: Create Required Branches
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          RELEASE_VERSION: ${{ steps.parse.outputs.release_version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          REPO="${OWNER}/${TARGET_REPO}"
+
+          MAIN_SHA=$(gh api \
+            "repos/${REPO}/git/ref/heads/main" \
+            --jq '.object.sha')
+
+          for BRANCH in \
+            "PRE-PROD" \
+            "RELEASE_${RELEASE_VERSION}" \
+            "FEATURE_cicd-RELEASE_${RELEASE_VERSION}"; do
+
+            echo "Checking branch: ${BRANCH}"
+
+            # Get the HTTP status without treating every API failure as 404.
+            HTTP_STATUS=$(gh api \
+              --include \
+              "repos/${REPO}/git/ref/heads/${BRANCH}" \
+              2>/dev/null |
+              head -n 1 |
+              tr -d '\r' |
+              awk '{print $2}' || true)
+
+            if [ "${HTTP_STATUS}" = "200" ]; then
+              echo "Branch ${BRANCH} already exists. Skipping."
+            elif [ "${HTTP_STATUS}" = "404" ]; then
+              echo "Creating branch ${BRANCH} from main..."
+
+              gh api \
+                --method POST \
+                "repos/${REPO}/git/refs" \
+                -f "ref=refs/heads/${BRANCH}" \
+                -f "sha=${MAIN_SHA}"
+
+              echo "Branch ${BRANCH} created successfully."
+            else
+              echo "::error::Could not verify branch ${BRANCH}. HTTP status: ${HTTP_STATUS:-unknown}"
+              exit 1
+            fi
+          done
+
+      # 9. Provision the workflows, PR template, and CODEOWNERS
+      - name: Provision Files to Release Branches
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ steps.parse.outputs.target_repo }}
+          RELEASE_VERSION: ${{ steps.parse.outputs.release_version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-repos
+
+          for FILE in \
+            templates/release/workflow-1.yml \
+            templates/release/workflow-2.yml \
+            templates/release/workflow-3.yml \
+            templates/release/PULL_REQUEST_TEMPLATE.md \
+            templates/release/CODEOWNERS; do
+
+            if [ ! -f "${FILE}" ]; then
+              echo "::error::Required template file is missing: ${FILE}"
+              exit 1
+            fi
+          done
+
+          for BRANCH in \
+            "RELEASE_${RELEASE_VERSION}" \
+            "FEATURE_cicd-RELEASE_${RELEASE_VERSION}"; do
+
+            echo "Provisioning files to ${BRANCH}..."
+
+            DEST="${GITHUB_WORKSPACE}/release-repos/${BRANCH}"
+
+            git clone \
+              --single-branch \
+              --branch "${BRANCH}" \
+              "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${TARGET_REPO}.git" \
+              "${DEST}"
+
+            mkdir -p "${DEST}/.github/workflows"
+
+            cp templates/release/workflow-1.yml \
+              "${DEST}/.github/workflows/workflow-1.yml"
+
+            cp templates/release/workflow-2.yml \
+              "${DEST}/.github/workflows/workflow-2.yml"
+
+            cp templates/release/workflow-3.yml \
+              "${DEST}/.github/workflows/workflow-3.yml"
+
+            cp templates/release/PULL_REQUEST_TEMPLATE.md \
+              "${DEST}/.github/PULL_REQUEST_TEMPLATE.md"
+
+            cp templates/release/CODEOWNERS \
+              "${DEST}/.github/CODEOWNERS"
+
+            git -C "${DEST}" config user.name "pipeline-utility-app"
+            git -C "${DEST}" config user.email "pipeline-utility-app[bot]@users.noreply.github.com"
+
+            git -C "${DEST}" add .github/
+
+            if git -C "${DEST}" diff --cached --quiet; then
+              echo "No changes to commit for ${BRANCH}."
+            else
+              git -C "${DEST}" commit \
+                -m "Provision release workflows and governance files"
+
+              git -C "${DEST}" push origin "HEAD:${BRANCH}"
+
+              echo "Files provisioned successfully to ${BRANCH}."
+            fi
+          done
+
+      # 10. Checkout the target repository default branch for Node.js provisioning
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ steps.parse.outputs.target_repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: target-repo
+
+      # 11. Provision the existing Node.js build pipeline
+      - name: Provision Pipeline
+        run: |
+          set -euo pipefail
+
+          mkdir -p target-repo/.github/workflows
+
+          cp generated/.github/workflows/build.yml \
+            target-repo/.github/workflows/build.yml
+
+          echo "Node.js pipeline provisioned:"
+          cat target-repo/.github/workflows/build.yml
+
+      # 12. Commit and push the Node.js pipeline
+      - name: Commit and Push Pipeline
+        working-directory: target-repo
+        run: |
+          set -euo pipefail
+
+          git config user.name "pipeline-utility-app"
+          git config user.email "pipeline-utility-app[bot]@users.noreply.github.com"
+
+          git add .github/workflows/build.yml
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Provision Node.js pipeline"
+            git push
+          fi
+
+      # 13. Display generated Node.js pipeline
+      - name: Display Generated Pipeline
+        run: |
+          echo "Target Repository: ${{ steps.parse.outputs.target_repo }}"
+          echo "Selected Template: ${{ steps.template.outputs.template_path }}"
+
+          echo "--------------------------------"
+          echo "Generated build.yml"
+          echo "--------------------------------"
+
+          cat generated/.github/workflows/build.yml

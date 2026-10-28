@@ -1,0 +1,11 @@
+name: Workflow 2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dummy-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Display Message
+        run: echo "Workflow 2 executed successfully"
