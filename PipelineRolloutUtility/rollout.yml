@@ -1,0 +1,395 @@
+name: Reusable Workflow Version Rollout
+
+on:
+  workflow_dispatch:
+    inputs:
+      tech_stack:
+        description: Technology stack to roll out
+        required: true
+        type: choice
+        options:
+          - java
+        default: java
+      target_branch:
+        description: 'Required: main, release/1.0.1, release/1.0.*, release/*, or comma-separated branches'
+        required: true
+        type: string
+      from_ref:
+        description: Current central reusable workflow version
+        required: true
+        type: string
+        default: v1.0.1
+      to_ref:
+        description: New central reusable workflow version
+        required: true
+        type: string
+        default: v1.0.2
+      dry_run:
+        description: Preview changes; do not push branches or create PRs
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Serializes rollout runs so overlapping wildcards cannot race on the same branch.
+concurrency:
+  group: reusable-workflow-rollout-${{ github.repository }}-${{ inputs.tech_stack }}
+  cancel-in-progress: false
+
+env:
+  CENTRAL_WORKFLOW: CanarysPlayground/TCSProject-Central-Repo/.github/workflows/pre-validation.yml
+
+jobs:
+  discover:
+    name: Discover matching repositories and branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.resolve.outputs.targets }}
+      count: ${{ steps.resolve.outputs.count }}
+    steps:
+      - name: Validate inputs
+        env:
+          ORG: ${{ vars.ORG_NAME }}
+          FROM_REF: ${{ inputs.from_ref }}
+          TO_REF: ${{ inputs.to_ref }}
+          BRANCH_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ORG" ]]; then
+            echo '::error::Set the ORG_NAME repository variable.'
+            exit 1
+          fi
+          for REF in "$FROM_REF" "$TO_REF"; do
+            if [[ ! "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid workflow version: $REF (expected vX.Y.Z)"
+              exit 1
+            fi
+          done
+          if [[ "$FROM_REF" == "$TO_REF" ]]; then
+            echo '::error::Current and new workflow versions must differ.'
+            exit 1
+          fi
+          if [[ -z "${BRANCH_INPUT//[[:space:]]/}" ]]; then
+            echo '::error::Enter at least one branch: main or a release branch/wildcard.'
+            exit 1
+          fi
+          echo "Branch input: $BRANCH_INPUT"
+          echo "Version update: $FROM_REF -> $TO_REF"
+
+      - name: Generate organization GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ vars.ORG_NAME }}
+
+      - name: Read organization custom properties
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ vars.ORG_NAME }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "/orgs/${ORG}/properties/values?per_page=100" > repositories.json
+          echo 'Retrieved organization repository custom properties.'
+
+      - name: Resolve repository and branch targets
+        id: resolve
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ vars.ORG_NAME }}
+          TECH_STACK: ${{ inputs.tech_stack }}
+          BRANCH_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import fnmatch
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          org = os.environ['ORG']
+          stack = os.environ['TECH_STACK'].lower()
+          raw = os.environ['BRANCH_INPUT'].strip()
+          pages = json.loads(Path('repositories.json').read_text())
+
+          # Require at least one branch: main or a release branch/wildcard selector.
+          # Empty items (e.g. trailing commas) are not allowed.
+          if not raw:
+              raise SystemExit('At least one branch selector is required (main or release/X.Y.Z).')
+          patterns = [value.strip() for value in raw.split(',')]
+          allowed = re.compile(
+              r'(?:main|release/(?:[0-9]+\.[0-9]+\.[0-9]+|'
+              r'[0-9]+\.[0-9]+\.\*|[0-9]+\.\*|\*))'
+          )
+          if any(not allowed.fullmatch(p) for p in patterns):
+              raise SystemExit(
+                  'Invalid branch selector. Use main, release/1.0.1, release/1.0.*, '
+                  'release/1.*, release/*, or a comma-separated combination.'
+              )
+
+          def api(endpoint, paginate=False):
+              cmd = ['gh', 'api']
+              if paginate:
+                  cmd += ['--paginate', '--slurp']
+              cmd.append(endpoint)
+              try:
+                  return json.loads(subprocess.check_output(cmd, text=True))
+              except subprocess.CalledProcessError as exc:
+                  raise SystemExit(
+                      f'Unable to read {endpoint}; check GitHub App installation '
+                      'access and Contents: read permission.'
+                  ) from exc
+
+          repos = set()
+          for page in pages:
+              for item in page:
+                  for prop in item.get('properties', []):
+                      if prop.get('property_name') != 'tech_stack':
+                          continue
+                      value = prop.get('value')
+                      values = value if isinstance(value, list) else [value]
+                      if any(str(v).lower() == stack for v in values):
+                          repos.add(item['repository_name'])
+
+          targets = []
+          for repo in sorted(repos):
+              branch_pages = api(
+                  f'repos/{org}/{repo}/branches?per_page=100', paginate=True
+              )
+              eligible_branches = {
+                  b['name'] for page in branch_pages for b in page
+                  if b['name'] == 'main' or re.fullmatch(r'release/[0-9]+\.[0-9]+\.[0-9]+', b['name'])
+              }
+              selected = sorted({
+                  branch for branch in eligible_branches
+                  if any(fnmatch.fnmatchcase(branch, p) for p in patterns)
+              })
+              if not selected:
+                  print(f'No matching existing branches: {org}/{repo}')
+              for branch in selected:
+                  targets.append({'repository': repo, 'branch': branch})
+                  print(f'TARGET: {org}/{repo} @ {branch}')
+
+          # Limit blast radius while piloting wildcard support.
+          if len(targets) > 25:
+              raise SystemExit(
+                  f'{len(targets)} targets exceed the 25-target POC safety limit; '
+                  'narrow your branch selector.'
+              )
+
+          print(f'Repositories with tech_stack={stack}: {len(repos)}')
+          print(f'Repository/branch targets: {len(targets)}')
+          # A sentinel avoids invalid empty-matrix evaluation. Job runs only when count > 0.
+          matrix = {'include': targets or [
+              {'repository': '__none__', 'branch': '__none__'}
+          ]}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('targets=' + json.dumps(matrix, separators=(',', ':')) + '\n')
+              out.write(f'count={len(targets)}\n')
+          PY
+
+  rollout:
+    name: Rollout ${{ matrix.repository }} / ${{ matrix.branch }}
+    needs: discover
+    if: ${{ needs.discover.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.discover.outputs.targets) }}
+
+    steps:
+      - name: Generate repository GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ vars.ORG_NAME }}
+          repositories: ${{ matrix.repository }}
+
+      - name: Validate selected branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ vars.ORG_NAME }}
+          REPO: ${{ matrix.repository }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+          echo "Checking ${ORG}/${REPO} @ ${TARGET_BRANCH}"
+          gh api "repos/${ORG}/${REPO}/git/ref/heads/${TARGET_BRANCH}" --jq '.object.sha'
+
+      - name: Checkout selected application branch
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.ORG_NAME }}/${{ matrix.repository }}
+          ref: ${{ matrix.branch }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: target-repo
+          persist-credentials: true
+
+      - name: Update reusable workflow version
+        id: update
+        working-directory: target-repo
+        env:
+          FROM_REF: ${{ inputs.from_ref }}
+          TO_REF: ${{ inputs.to_ref }}
+          CENTRAL_WORKFLOW: ${{ env.CENTRAL_WORKFLOW }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          old = os.environ['CENTRAL_WORKFLOW'] + '@' + os.environ['FROM_REF']
+          new = os.environ['CENTRAL_WORKFLOW'] + '@' + os.environ['TO_REF']
+          pattern = re.compile(
+              r'(^[ \t]*uses:[ \t]*[\'\"]?)' + re.escape(old) +
+              r'(?=[ \t]*(?:#|$)|[\'\"])', re.MULTILINE
+          )
+          directory = Path('.github/workflows')
+          changes = []
+          if directory.is_dir():
+              for path in sorted(list(directory.glob('*.yml')) + list(directory.glob('*.yaml'))):
+                  original = path.read_bytes().decode('utf-8')
+                  updated, count = pattern.subn(lambda m: m.group(1) + new, original)
+                  if count:
+                      path.write_bytes(updated.encode('utf-8'))
+                      changes.append((str(path), count))
+          for name, count in changes:
+              print(f'Updated {name}: {count} caller reference(s)')
+          if not changes:
+              print(f'No matching caller reference: {old}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"changed={'true' if changes else 'false'}\n")
+          PY
+
+      - name: Show proposed changes
+        if: ${{ steps.update.outputs.changed == 'true' }}
+        working-directory: target-repo
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff -- .github/workflows
+
+      - name: Dry-run summary
+        if: ${{ steps.update.outputs.changed == 'true' && inputs.dry_run }}
+        env:
+          REPO: ${{ matrix.repository }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+          FROM_REF: ${{ inputs.from_ref }}
+          TO_REF: ${{ inputs.to_ref }}
+        run: |
+          echo "DRY RUN: $REPO @ $TARGET_BRANCH: $FROM_REF -> $TO_REF"
+          echo 'No branch was pushed and no pull request was created.'
+
+      - name: No update required
+        if: ${{ steps.update.outputs.changed != 'true' }}
+        env:
+          REPO: ${{ matrix.repository }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+        run: |
+          echo "SKIPPED: no matching old reusable workflow reference in $REPO @ $TARGET_BRANCH."
+
+      - name: Check for duplicate open PR
+        id: existing-pr
+        if: ${{ steps.update.outputs.changed == 'true' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ vars.ORG_NAME }}
+          REPO: ${{ matrix.repository }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+          TECH_STACK: ${{ inputs.tech_stack }}
+          FROM_REF: ${{ inputs.from_ref }}
+          TO_REF: ${{ inputs.to_ref }}
+        run: |
+          set -euo pipefail
+          TITLE="chore: update ${TECH_STACK} reusable workflow ${FROM_REF} to ${TO_REF} (${TARGET_BRANCH})"
+          COUNT=$(gh pr list --repo "${ORG}/${REPO}" --state open \
+            --base "$TARGET_BRANCH" --limit 100 --json number,title \
+            | jq --arg title "$TITLE" '[.[] | select(.title == $title)] | length')
+          if [[ "$COUNT" -gt 0 ]]; then
+            echo 'Matching rollout PR already exists; not creating a duplicate.'
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure GitHub App commit identity
+        if: ${{ steps.update.outputs.changed == 'true' && !inputs.dry_run && steps.existing-pr.outputs.exists != 'true' }}
+        working-directory: target-repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          BOT_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq '.id')
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${BOT_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Create temporary automation branch and push
+        id: push
+        if: ${{ steps.update.outputs.changed == 'true' && !inputs.dry_run && steps.existing-pr.outputs.exists != 'true' }}
+        working-directory: target-repo
+        env:
+          TARGET_BRANCH: ${{ matrix.branch }}
+          TECH_STACK: ${{ inputs.tech_stack }}
+          FROM_REF: ${{ inputs.from_ref }}
+          TO_REF: ${{ inputs.to_ref }}
+          JOB_INDEX: ${{ strategy.job-index }}
+        run: |
+          set -euo pipefail
+          BRANCH_SLUG="${TARGET_BRANCH//\//-}"
+          BRANCH="automation/${BRANCH_SLUG}-${TECH_STACK}-${FROM_REF}-to-${TO_REF}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${JOB_INDEX}"
+          echo "Creating $BRANCH from $TARGET_BRANCH"
+          git switch -c "$BRANCH"
+          git add .github/workflows
+          git commit -m "chore: update reusable workflow ${FROM_REF} to ${TO_REF}"
+          git push origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request against selected branch
+        id: pr
+        if: ${{ steps.update.outputs.changed == 'true' && !inputs.dry_run && steps.existing-pr.outputs.exists != 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ vars.ORG_NAME }}
+          REPO: ${{ matrix.repository }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+          TECH_STACK: ${{ inputs.tech_stack }}
+          FROM_REF: ${{ inputs.from_ref }}
+          TO_REF: ${{ inputs.to_ref }}
+        run: |
+          set -euo pipefail
+          TITLE="chore: update ${TECH_STACK} reusable workflow ${FROM_REF} to ${TO_REF} (${TARGET_BRANCH})"
+          BODY=$(printf 'Automated reusable workflow version rollout.\n\nTarget branch: %s\nTechnology stack: %s\nPrevious version: %s\nNew version: %s\n\nReview and validate before merging.\n' \
+            "$TARGET_BRANCH" "$TECH_STACK" "$FROM_REF" "$TO_REF")
+          PR_URL=$(gh pr create --repo "${ORG}/${REPO}" \
+            --base "$TARGET_BRANCH" --head "$BRANCH" \
+            --title "$TITLE" --body "$BODY")
+          echo "PR created: $PR_URL"
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Rollout summary
+        if: ${{ steps.update.outputs.changed == 'true' && !inputs.dry_run }}
+        env:
+          REPO: ${{ matrix.repository }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+          EXISTING: ${{ steps.existing-pr.outputs.exists }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          if [[ "$EXISTING" == 'true' ]]; then
+            echo "Existing PR found for $REPO @ $TARGET_BRANCH; no duplicate created."
+          else
+            echo "Created rollout PR for $REPO @ $TARGET_BRANCH: $PR_URL"
+          fi
