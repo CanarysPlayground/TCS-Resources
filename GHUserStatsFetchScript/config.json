@@ -1,6 +1,7 @@
 {
   "github": {
-    "api_url": "https://api.github.com",
+    "github_com_api_url": "",
+    "ghe_api_url": "https://api.<subdomain>.ghe.com",
     "app_client_id": "",
     "private_key_path": ".pem"
   },
@@ -24,7 +25,7 @@
     "max_runner_runs_per_repo": 50
   },
   "runtime": {
-    "max_workers": 4,
+    "max_workers": 8,
     "request_timeout_seconds": 30,
     "max_retries": 5,
     "rate_limit_buffer": 25,
