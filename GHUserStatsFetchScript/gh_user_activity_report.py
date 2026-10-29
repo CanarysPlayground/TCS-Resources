@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-GitHub User Activity Report (GitHub App authentication, multi-org / multi-repo).
-
 Requirements (Python 3.9+):
     pip install "requests>=2.31" "PyJWT[crypto]>=2.8" "openpyxl>=3.1"
 
 GitHub App permissions (all read-only):
     Repository   : Metadata, Contents, Pull requests, Issues, Administration
-    Organization : Members, Self-hosted runners
+    Organization : Members, Self-hosted runners, Custom properties
 
 Usage:
-    python gh_user_activity_report.py --config config.json
+    python gh_user_activity_report.py
 """
 
 import argparse
@@ -221,21 +219,103 @@ def load_config(path: Path) -> Config:
     report = _section(raw, "report")
     runtime = _section(raw, "runtime")
 
-    api_url = _req_str(github, "api_url", "github").rstrip("/")
+    # ------------------------------------------------------------------
+    # Instance API URL Resolution:
+    # Supports both github.com and GitHub Enterprise (GHE / GHEC EMU)
+    # in the same config file. Automatically selects whichever is filled.
+    # ------------------------------------------------------------------
+    def _clean_str(val: Any) -> Optional[str]:
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return None
+
+    ghe_url = _clean_str(github.get("ghe_api_url") or github.get("ghec_api_url") or github.get("ghe_url"))
+    github_com_url = _clean_str(github.get("github_com_api_url") or github.get("github_api_url") or github.get("github_url"))
+    legacy_url = _clean_str(github.get("api_url"))
+
+    if ghe_url:
+        ghe_url = ghe_url.rstrip("/")
+    if github_com_url:
+        github_com_url = github_com_url.rstrip("/")
+    if legacy_url:
+        legacy_url = legacy_url.rstrip("/")
+
+    api_url: Optional[str] = None
+    target_env: str = ""
+
+    if ghe_url and github_com_url:
+        raise ConfigError(
+            f"Ambiguous instance configuration: both 'github.ghe_api_url' ('{ghe_url}') and "
+            f"'github.github_com_api_url' ('{github_com_url}') are populated in {path.name}. "
+            "Please populate only the target instance URL and leave the unused one empty (e.g. \"\") "
+            "so the script can automatically select the appropriate environment."
+        )
+    elif ghe_url:
+        api_url = ghe_url
+        target_env = "ghe"
+    elif github_com_url:
+        api_url = github_com_url
+        target_env = "github_com"
+    elif legacy_url:
+        api_url = legacy_url
+        target_env = "generic"
+    else:
+        raise ConfigError(
+            f"No GitHub API URL configured in {path.name}. Please populate either 'github.github_com_api_url' "
+            "(e.g. 'https://api.github.com') or 'github.ghe_api_url' (e.g. 'https://api.<tenant>.ghe.com')."
+        )
+
     parsed = urlparse(api_url)
+    if parsed.hostname and parsed.hostname.endswith(".ghe.com") and not parsed.hostname.startswith("api."):
+        # Auto-normalize tenant.ghe.com -> api.tenant.ghe.com for GHEC EMU with data residency
+        api_url = f"{parsed.scheme}://api.{parsed.hostname}{parsed.path}"
+        parsed = urlparse(api_url)
+
     if (parsed.scheme != "https" or not parsed.hostname or parsed.hostname == "github.com"
             or parsed.username or parsed.path not in ("", "/api/v3") or parsed.query or parsed.fragment):
-        # Userinfo is dropped so embedded credentials are never echoed.
         received = f"{parsed.scheme}://{parsed.hostname or ''}{parsed.path}"
-        raise ConfigError(f"'github.api_url' is '{received}' but must be the API root only: https://api.github.com, "
-                          "https://api.<subdomain>.ghe.com or https://<ghes-host>/api/v3")
+        raise ConfigError(f"Selected GitHub API URL '{received}' is invalid. It must be the API root only: "
+                          "https://api.github.com, https://api.<subdomain>.ghe.com, or https://<ghes-host>/api/v3")
 
-    key_path = base_dir / _req_str(github, "private_key_path", "github")
+    # Instance-specific client_id fallback (supports ghe_app_client_id or shared app_client_id)
+    client_id = None
+    if target_env == "ghe":
+        client_id = _clean_str(github.get("ghe_app_client_id"))
+    elif target_env == "github_com":
+        client_id = _clean_str(github.get("github_com_app_client_id"))
+    if not client_id:
+        client_id = _clean_str(github.get("app_client_id") or github.get("client_id"))
+    if not client_id:
+        raise ConfigError(f"'github.app_client_id' is required in {path.name}")
+
+    # Instance-specific private_key_path fallback (supports ghe_private_key_path or shared private_key_path)
+    key_rel = None
+    if target_env == "ghe":
+        key_rel = _clean_str(github.get("ghe_private_key_path"))
+    elif target_env == "github_com":
+        key_rel = _clean_str(github.get("github_com_private_key_path"))
+    if not key_rel:
+        key_rel = _clean_str(github.get("private_key_path"))
+    if not key_rel:
+        raise ConfigError(f"'github.private_key_path' is required in {path.name}")
+
+    key_path = base_dir / key_rel
     if not key_path.is_file():
         raise ConfigError(f"GitHub App private key not found: {key_path}")
     private_key = key_path.read_text(encoding="ascii")
     if "PRIVATE KEY" not in private_key:
         raise ConfigError(f"File is not a PEM private key: {key_path}")
+
+    # Instance-specific repos_csv fallback (supports ghe_repos_csv or shared repos_csv)
+    repos_csv_rel = None
+    if target_env == "ghe":
+        repos_csv_rel = _clean_str(inputs.get("ghe_repos_csv"))
+    elif target_env == "github_com":
+        repos_csv_rel = _clean_str(inputs.get("github_com_repos_csv"))
+    if not repos_csv_rel:
+        repos_csv_rel = _clean_str(inputs.get("repos_csv"))
+    if not repos_csv_rel:
+        raise ConfigError(f"'input.repos_csv' is required in {path.name}")
 
     file_prefix = output.get("file_prefix", "github_user_activity")
     if not isinstance(file_prefix, str) or not PREFIX_RE.fullmatch(file_prefix):
@@ -272,9 +352,9 @@ def load_config(path: Path) -> Config:
 
     return Config(
         api_url=api_url,
-        client_id=_req_str(github, "app_client_id", "github"),
+        client_id=client_id,
         private_key=private_key,
-        repos_csv=base_dir / _req_str(inputs, "repos_csv", "input"),
+        repos_csv=base_dir / repos_csv_rel,
         output_dir=base_dir / str(output.get("directory", "reports")),
         file_prefix=file_prefix,
         lookback_days=_opt_int(report, "lookback_days", "report", 90, 1, 3650),
@@ -469,33 +549,52 @@ class GitHubClient:
 
                 # 2. App-level JWT rate limit (applies to /app/* endpoints using JWT bearer auth: 60 req/hr)
                 if is_app_auth:
+                    if self._app_reset is not None and now >= self._app_reset:
+                        self._app_remaining = None
+                        self._app_reset = None
+                        self._app_pause_until = 0.0
+
                     if self._app_pause_until > now:
                         pause_wait = max(pause_wait, self._app_pause_until - now)
                     elif pause_wait == 0.0 and self._app_remaining is not None and self._app_remaining <= 5:
                         reset_at = self._app_reset or (now + 60.0)
-                        needed = max(0.0, reset_at - now) + 2.0
-                        self._app_pause_until = now + needed
-                        pause_wait = needed
-                        LOG.warning("Proactive App-level rate limit pause: %d JWT requests remaining; waiting %.1fs until reset",
-                                    self._app_remaining, needed)
+                        if reset_at > now:
+                            needed = (reset_at - now) + 2.0
+                            self._app_pause_until = now + needed
+                            pause_wait = needed
+                            LOG.warning("Proactive App-level rate limit pause: %d JWT requests remaining; waiting %.1fs until reset",
+                                        self._app_remaining, needed)
+                        else:
+                            self._app_remaining = None
+                            self._app_reset = None
 
-                # 3. Org-specific pause (primary installation rate limit reset for this installation: 5,000-12,500 req/hr)
+                # 3. Org-specific pause (primary installation rate limit reset: 5,000 baseline up to 15,000 req/hr on Enterprise Cloud)
                 if not is_app_auth and org_key:
+                    rst = self._org_reset.get(org_key)
+                    if rst is not None and now >= rst:
+                        self._org_remaining.pop(org_key, None)
+                        self._org_reset.pop(org_key, None)
+                        self._org_pause_until.pop(org_key, None)
+
                     if self._org_pause_until.get(org_key, 0.0) > now:
                         pause_wait = max(pause_wait, self._org_pause_until[org_key] - now)
                     elif pause_wait == 0.0:
                         remaining = self._org_remaining.get(org_key)
                         if remaining is not None and remaining <= self._rate_limit_buffer:
                             reset_at = self._org_reset.get(org_key, now + 60.0)
-                            needed = max(0.0, reset_at - now) + 2.0
-                            if needed > self._max_rate_limit_wait:
-                                LOG.error("Rate limit reset for %s is %.0fs away, exceeding max wait %ds",
-                                          org, needed, self._max_rate_limit_wait)
+                            if reset_at > now:
+                                needed = (reset_at - now) + 2.0
+                                if needed > self._max_rate_limit_wait:
+                                    LOG.error("Rate limit reset for %s is %.0fs away, exceeding max wait %ds",
+                                              org, needed, self._max_rate_limit_wait)
+                                else:
+                                    self._org_pause_until[org_key] = now + needed
+                                    pause_wait = needed
+                                    LOG.warning("Proactive installation rate limit pause for %s: %d requests remaining; waiting %.1fs until reset",
+                                                org, remaining, needed)
                             else:
-                                self._org_pause_until[org_key] = now + needed
-                                pause_wait = needed
-                                LOG.warning("Proactive installation rate limit pause for %s: %d requests remaining; waiting %.1fs until reset",
-                                            org, remaining, needed)
+                                self._org_remaining.pop(org_key, None)
+                                self._org_reset.pop(org_key, None)
 
                 if pause_wait > 0.0:
                     pass
@@ -551,8 +650,26 @@ class GitHubClient:
                 yield from data
             url, query = self._next_url(resp), None
 
+    def graphql(self, org: str, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        token = self.authenticate(org)
+        payload = {"query": query, "variables": variables or {}}
+        if self._cfg.api_url.endswith("/api/v3"):
+            graphql_url = f"{self._cfg.api_url[:-7]}/api/graphql"
+        else:
+            graphql_url = f"{self._cfg.api_url.rstrip('/')}/graphql"
+        resp = self._send("POST", graphql_url, {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }, json_data=payload, org=org)
+        self._raise_for_status(resp)
+        data = resp.json()
+        if isinstance(data, dict) and "errors" in data and not data.get("data"):
+            raise GitHubAPIError(resp.status_code, f"GraphQL error: {data['errors']}")
+        return data
+
     def _send(self, method: str, url: str, headers: Dict[str, str],
               params: Optional[Dict[str, Any]] = None,
+              json_data: Optional[Dict[str, Any]] = None,
               org: Optional[str] = None,
               is_app_auth: bool = False) -> requests.Response:
         if not url.startswith("https://"):
@@ -561,7 +678,7 @@ class GitHubClient:
 
         for attempt in range(self._cfg.max_retries + 1):
             self._coordinate_rate_limit(org, is_app_auth=is_app_auth)
-            resp = self._http().request(method, url, headers=headers, params=params, timeout=self._cfg.timeout)
+            resp = self._http().request(method, url, headers=headers, params=params, json=json_data, timeout=self._cfg.timeout)
 
             # Record rate limit headers for proactive tracking
             rem = resp.headers.get("X-RateLimit-Remaining")
@@ -760,6 +877,82 @@ class RepositoryReport:
     errors: List[str] = field(default_factory=list)
 
 
+def collect_pull_requests_graphql(client: GitHubClient, org: str, repo: str,
+                                  collected_since: datetime, since: datetime, end: datetime,
+                                  exclude_bots: bool, report: Optional[RepositoryReport],
+                                  record_fn: Any) -> bool:
+    query = """
+    query($owner: String!, $name: String!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequests(first: 50, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            number
+            createdAt
+            mergedAt
+            updatedAt
+            author {
+              login
+            }
+            reviews(first: 50) {
+              nodes {
+                author {
+                  login
+                }
+                submittedAt
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    cursor = None
+    while True:
+        data = client.graphql(org, query, {"owner": org, "name": repo, "cursor": cursor})
+        repo_data = (data.get("data") or {}).get("repository")
+        if not repo_data:
+            return False
+        prs = (repo_data.get("pullRequests") or {}).get("nodes") or []
+        for pr in prs:
+            updated_at = parse_ts(pr["updatedAt"])
+            if updated_at < collected_since:
+                return True
+            author_dict = {"login": pr["author"]["login"]} if pr.get("author") and pr["author"].get("login") else None
+            record_fn(author_dict, "prs_opened", pr.get("createdAt"))
+            record_fn(author_dict, "prs_merged", pr.get("mergedAt"))
+            created = parse_ts(pr["createdAt"])
+            eligible = not (exclude_bots and author_dict and is_bot(author_dict))
+            if report is not None and eligible and since <= created <= end:
+                report.cohort_opened += 1
+                if pr.get("mergedAt") and parse_ts(pr["mergedAt"]) <= end:
+                    report.cohort_merged += 1
+            first_review: Optional[datetime] = None
+            reviews = (pr.get("reviews") or {}).get("nodes") or []
+            for review in reviews:
+                if review.get("state") == "PENDING" or not review.get("submittedAt"):
+                    continue
+                reviewer_dict = {"login": review["author"]["login"]} if review.get("author") and review["author"].get("login") else None
+                record_fn(reviewer_dict, "reviews", review["submittedAt"])
+                submitted = parse_ts(review["submittedAt"])
+                if (reviewer_dict and reviewer_dict.get("login") and author_dict
+                        and reviewer_dict["login"].lower() != (author_dict.get("login") or "").lower()
+                        and not (exclude_bots and is_bot(reviewer_dict)) and created <= submitted <= end):
+                    first_review = min(first_review, submitted) if first_review else submitted
+            if report is not None and first_review and since <= first_review <= end:
+                report.review_hours.append((first_review - created).total_seconds() / 3600)
+
+        page_info = (repo_data.get("pullRequests") or {}).get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+    return True
+
+
 def collect_repo(client: GitHubClient, org: str, repo: str, since: datetime,
                  exclude_bots: bool, end: Optional[datetime] = None,
                  report: Optional[RepositoryReport] = None) -> Dict[str, Activity]:
@@ -780,43 +973,61 @@ def collect_repo(client: GitHubClient, org: str, repo: str, since: datetime,
         if since <= when <= end and login:
             activity[login].add(metric, when)
 
-    for commit in client.paginate(org, f"{base}/commits", {
-            **since_param, "until": end.strftime("%Y-%m-%dT%H:%M:%SZ")}):
-        record(commit.get("author"), "commits", commit["commit"]["author"]["date"])
+    # 1. Commits: skip if repo metadata proves no pushes occurred in the collection window
+    pushed_at_str = report.metadata.get("pushed_at") if report and report.metadata else None
+    pushed_at = parse_ts(pushed_at_str) if pushed_at_str else None
+    if not (pushed_at and pushed_at < collected_since):
+        for commit in client.paginate(org, f"{base}/commits", {
+                **since_param, "until": end.strftime("%Y-%m-%dT%H:%M:%SZ")}):
+            record(commit.get("author"), "commits", commit["commit"]["author"]["date"])
 
+    # 2. Pull requests & reviews: use GraphQL for bulk retrieval (avoids 1 REST call per PR for reviews)
     pull_requests_enabled = report is None or report.metadata.get("has_pull_requests", True)
     if pull_requests_enabled:
-        pulls = client.paginate(org, f"{base}/pulls", {"state": "all", "sort": "updated", "direction": "desc"})
-        for pr in pulls:
-            if parse_ts(pr["updated_at"]) < collected_since:
-                break
-            record(pr.get("user"), "prs_opened", pr["created_at"])
-            record(pr.get("user"), "prs_merged", pr.get("merged_at"))
-            created = parse_ts(pr["created_at"])
-            eligible = not (exclude_bots and is_bot(pr.get("user") or {}))
-            if report is not None and eligible and since <= created <= end:
-                report.cohort_opened += 1
-                if pr.get("merged_at") and parse_ts(pr["merged_at"]) <= end:
-                    report.cohort_merged += 1
-            first_review: Optional[datetime] = None
-            for review in client.paginate(org, f"{base}/pulls/{pr['number']}/reviews"):
-                reviewer = review.get("user") or {}
-                if review.get("state") == "PENDING" or not review.get("submitted_at"):
-                    continue
-                record(reviewer, "reviews", review["submitted_at"])
-                submitted = parse_ts(review["submitted_at"])
-                if (reviewer.get("login") and reviewer["login"].lower() != (pr.get("user") or {}).get("login", "").lower()
-                        and not (exclude_bots and is_bot(reviewer)) and created <= submitted <= end):
-                    first_review = min(first_review, submitted) if first_review else submitted
-            if report is not None and first_review and since <= first_review <= end:
-                report.review_hours.append((first_review - created).total_seconds() / 3600)
+        pr_success = False
+        try:
+            pr_success = collect_pull_requests_graphql(
+                client, org, repo, collected_since, since, end, exclude_bots, report, record
+            )
+        except (GitHubAPIError, requests.RequestException, KeyError, ValueError) as exc:
+            LOG.debug("GraphQL PR collection unavailable for %s/%s (%s); falling back to REST", org, repo, exc)
+            pr_success = False
 
-    for issue in client.paginate(org, f"{base}/issues", {"state": "all", **since_param}):
-        if "pull_request" not in issue:
-            record(issue.get("user"), "issues_opened", issue["created_at"])
+        if not pr_success:
+            pulls = client.paginate(org, f"{base}/pulls", {"state": "all", "sort": "updated", "direction": "desc"})
+            for pr in pulls:
+                if parse_ts(pr["updated_at"]) < collected_since:
+                    break
+                record(pr.get("user"), "prs_opened", pr["created_at"])
+                record(pr.get("user"), "prs_merged", pr.get("merged_at"))
+                created = parse_ts(pr["created_at"])
+                eligible = not (exclude_bots and is_bot(pr.get("user") or {}))
+                if report is not None and eligible and since <= created <= end:
+                    report.cohort_opened += 1
+                    if pr.get("merged_at") and parse_ts(pr["merged_at"]) <= end:
+                        report.cohort_merged += 1
+                first_review: Optional[datetime] = None
+                for review in client.paginate(org, f"{base}/pulls/{pr['number']}/reviews"):
+                    reviewer = review.get("user") or {}
+                    if review.get("state") == "PENDING" or not review.get("submitted_at"):
+                        continue
+                    record(reviewer, "reviews", review["submitted_at"])
+                    submitted = parse_ts(review["submitted_at"])
+                    if (reviewer.get("login") and reviewer["login"].lower() != (pr.get("user") or {}).get("login", "").lower()
+                            and not (exclude_bots and is_bot(reviewer)) and created <= submitted <= end):
+                        first_review = min(first_review, submitted) if first_review else submitted
+                if report is not None and first_review and since <= first_review <= end:
+                    report.review_hours.append((first_review - created).total_seconds() / 3600)
 
-    for comment in client.paginate(org, f"{base}/issues/comments", since_param):
-        record(comment.get("user"), "issue_comments", comment["created_at"])
+    # 3. Issues & Comments: skip if repository has issues disabled
+    has_issues = report.metadata.get("has_issues", True) if report and report.metadata else True
+    if has_issues:
+        for issue in client.paginate(org, f"{base}/issues", {"state": "all", **since_param}):
+            if "pull_request" not in issue:
+                record(issue.get("user"), "issues_opened", issue["created_at"])
+
+        for comment in client.paginate(org, f"{base}/issues/comments", since_param):
+            record(comment.get("user"), "issue_comments", comment["created_at"])
 
     if pull_requests_enabled:
         for comment in client.paginate(org, f"{base}/pulls/comments", since_param):
@@ -853,17 +1064,51 @@ def property_value_streams(properties: Any, property_names: Any = ("VALUE_STREAM
     return tuple(sorted(mapped_values, key=str.casefold)) or ("Unmapped",)
 
 
+def fetch_org_custom_properties(client: GitHubClient, orgs: List[str]) -> Dict[Tuple[str, str], Any]:
+    """Fetch custom property values for all repositories in the organization in bulk (30 calls vs 3000 calls)."""
+    props: Dict[Tuple[str, str], Any] = {}
+    for org in orgs:
+        try:
+            for item in client.paginate(org, f"/orgs/{org}/properties/values"):
+                repo_name = item.get("repository_name")
+                if repo_name and "properties" in item:
+                    props[(org.casefold(), repo_name.casefold())] = item["properties"]
+        except (GitHubAPIError, requests.RequestException) as exc:
+            LOG.debug("Org-level custom properties not available for %s (%s); will fall back per-repo", org, exc)
+    return props
+
+
 def collect_repository(client: GitHubClient, org: str, repo: str, since: datetime,
                        end: datetime, exclude_bots: bool,
-                       property_names: Tuple[str, ...] = ("VALUE_STREAM", "value_stream")) -> RepositoryReport:
+                       property_names: Tuple[str, ...] = ("VALUE_STREAM", "value_stream"),
+                       cached_metadata: Optional[Dict[str, Any]] = None,
+                       cached_properties: Optional[Any] = None) -> RepositoryReport:
     LOG.info("Scanning repository %s/%s...", org, repo)
     report = RepositoryReport()
     base = f"/repos/{org}/{repo}"
-    report.metadata = client.get(org, base)
-    try:
-        report.value_streams = property_value_streams(client.get(org, f"{base}/properties/values"), property_names)
-    except (GitHubAPIError, requests.RequestException, ValueError) as exc:
-        report.errors.append(f"Value-stream custom property: {exc}")
+
+    # 1. Repository metadata: use cache from resolve_targets to eliminate 1 REST call per repo
+    if cached_metadata is not None:
+        report.metadata = cached_metadata
+    else:
+        try:
+            report.metadata = client.get(org, base)
+        except (GitHubAPIError, requests.RequestException) as exc:
+            report.errors.append(f"Metadata: {exc}")
+            return report
+
+    # 2. Value-stream custom properties: use org-level bulk cache when available
+    if cached_properties is not None:
+        try:
+            report.value_streams = property_value_streams(cached_properties, property_names)
+        except ValueError as exc:
+            report.errors.append(f"Value-stream custom property: {exc}")
+    else:
+        try:
+            report.value_streams = property_value_streams(client.get(org, f"{base}/properties/values"), property_names)
+        except (GitHubAPIError, requests.RequestException, ValueError) as exc:
+            report.errors.append(f"Value-stream custom property: {exc}")
+
     if report.value_streams == ("Unmapped",):
         metadata_properties = report.metadata.get("custom_properties")
         if isinstance(metadata_properties, dict):
@@ -876,51 +1121,90 @@ def collect_repository(client: GitHubClient, org: str, repo: str, since: datetim
         if report.value_streams == ("Unmapped",):
             LOG.debug("No configured value-stream property found for %s/%s; available custom property names: %s",
                       org, repo, sorted(metadata_properties) if isinstance(metadata_properties, dict) else "not included")
-    try:
-        report.users = collect_repo(client, org, repo, since, exclude_bots, end, report)
+
+    # 3. Dormant repository check:
+    # If the repository is empty (size == 0) or both pushed_at and updated_at are before 'since',
+    # there is zero activity in the lookback window. Skip 5 endpoint queries (/commits, /pulls, etc.)
+    size = report.metadata.get("size", 1)
+    pushed_at_str = report.metadata.get("pushed_at")
+    updated_at_str = report.metadata.get("updated_at")
+    pushed_at = parse_ts(pushed_at_str) if pushed_at_str else None
+    updated_at = parse_ts(updated_at_str) if updated_at_str else None
+
+    is_dormant = bool(
+        size == 0
+        or (pushed_at and pushed_at < since and updated_at and updated_at < since)
+    )
+
+    if is_dormant:
+        report.users = {}
         report.activity_complete = True
-    except (GitHubAPIError, requests.RequestException, KeyError, ValueError) as exc:
-        report.errors.append(f"Activity: {exc}")
-        report.events.clear()
-        report.review_hours.clear()
-        report.cohort_opened = report.cohort_merged = 0
-    try:
-        report.protected_branches = tuple(sorted(
-            (branch["name"] for branch in client.paginate(org, f"{base}/branches", {"protected": "true"})),
-            key=str.casefold))
-        report.protected = "Yes" if report.protected_branches else "No"
-    except (GitHubAPIError, requests.RequestException) as exc:
-        report.errors.append(f"Branch protection: {exc}")
+        LOG.debug("Repository %s/%s is dormant; skipping activity scan", org, repo)
+    else:
+        try:
+            report.users = collect_repo(client, org, repo, since, exclude_bots, end, report)
+            report.activity_complete = True
+        except (GitHubAPIError, requests.RequestException, KeyError, ValueError) as exc:
+            report.errors.append(f"Activity: {exc}")
+            report.events.clear()
+            report.review_hours.clear()
+            report.cohort_opened = report.cohort_merged = 0
+
+    # 4. Branch protection: skip if repo is empty or archived
+    if size == 0 or report.metadata.get("archived"):
+        report.protected = "No"
+        report.protected_branches = ()
+    else:
+        try:
+            report.protected_branches = tuple(sorted(
+                (branch["name"] for branch in client.paginate(org, f"{base}/branches", {"protected": "true"})),
+                key=str.casefold))
+            report.protected = "Yes" if report.protected_branches else "No"
+        except (GitHubAPIError, requests.RequestException) as exc:
+            report.errors.append(f"Branch protection: {exc}")
+
+    # 5. CODEOWNERS check: single tree query instead of 3 sequential 404 GET calls
     try:
         branch = report.metadata.get("default_branch")
-        if not branch:
+        if not branch or size == 0:
             report.codeowners = "No"
         else:
-            for path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
-                try:
-                    content = client.get(org, f"{base}/contents/{path}", {"ref": branch})
-                except GitHubAPIError as exc:
-                    if exc.status == 404:
-                        continue
-                    raise
-                if isinstance(content, dict) and content.get("type") == "file":
-                    report.codeowners, report.codeowners_path = "Yes", path
-                    break
-            else:
-                report.codeowners = "No"
+            try:
+                tree_data = client.get(org, f"{base}/git/trees/{branch}", {"recursive": "1"})
+                tree_paths = {item["path"] for item in tree_data.get("tree", []) if item.get("type") == "blob"}
+                for path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+                    if path in tree_paths:
+                        report.codeowners, report.codeowners_path = "Yes", path
+                        break
+                else:
+                    report.codeowners = "No"
+            except (GitHubAPIError, requests.RequestException):
+                for path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+                    try:
+                        content = client.get(org, f"{base}/contents/{path}", {"ref": branch})
+                    except GitHubAPIError as exc:
+                        if exc.status == 404:
+                            continue
+                        raise
+                    if isinstance(content, dict) and content.get("type") == "file":
+                        report.codeowners, report.codeowners_path = "Yes", path
+                        break
+                else:
+                    report.codeowners = "No"
     except (GitHubAPIError, requests.RequestException) as exc:
         report.errors.append(f"CODEOWNERS: {exc}")
     return report
 
 
 def resolve_targets(client: GitHubClient, entries: List[RepoEntry],
-                    cfg: Config) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+                    cfg: Config) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], Dict[Tuple[str, str], Dict[str, Any]]]:
     by_org: Dict[str, List[RepoEntry]] = defaultdict(list)
     for entry in entries:
         by_org[entry.org.lower()].append(entry)
 
     targets: List[Tuple[str, str]] = []
     failures: List[Tuple[str, str]] = []
+    metadata_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for rows in by_org.values():
         org = rows[0].org
         wildcard = [row for row in rows if row.repo == "*"]
@@ -935,9 +1219,11 @@ def resolve_targets(client: GitHubClient, entries: List[RepoEntry],
             client.authenticate(org)
             if wildcard:
                 for repo in client.paginate(org, f"/orgs/{org}/repos", {"type": "all"}):
-                    if (repo["archived"] and not cfg.include_archived) or (repo["fork"] and not cfg.include_forks):
+                    r_name = repo["name"]
+                    metadata_cache[(org.casefold(), r_name.casefold())] = repo
+                    if (repo.get("archived") and not cfg.include_archived) or (repo.get("fork") and not cfg.include_forks):
                         continue
-                    include.setdefault(repo["name"].lower(), repo["name"])
+                    include.setdefault(r_name.lower(), r_name)
         except (GitHubAPIError, requests.RequestException) as exc:
             LOG.error("Organization %s skipped: %s", org, exc)
             failures.append((org, str(exc)))
@@ -945,7 +1231,7 @@ def resolve_targets(client: GitHubClient, entries: List[RepoEntry],
         selected = [(org, name) for key, name in sorted(include.items()) if key not in exclude]
         LOG.info("Organization %s: %d repositories selected", org, len(selected))
         targets.extend(selected)
-    return targets, failures
+    return targets, failures, metadata_cache
 
 
 def fetch_members(client: GitHubClient, orgs: List[str], exclude_bots: bool,
@@ -990,32 +1276,48 @@ def fetch_team_access(client: GitHubClient, orgs: List[str], reports: Dict[Tuple
         matched_repository_refs: Set[Tuple[str, str]] = set()
         mapped_repository_refs: Set[Tuple[str, str]] = set()
         team_members_by_slug: Dict[str, Tuple[str, Set[str]]] = {}
-        for team in teams:
+
+        def _fetch_team_details(team: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, str]]]:
+            slug = team.get("slug")
+            name = team.get("name") or slug
+            team_errors: List[Tuple[str, str]] = []
+            if not slug or not name:
+                team_errors.append((f"{org} (team entry)", "GitHub returned a team without a name or slug"))
+                return team, [], [], team_errors
+            t_members: List[Dict[str, Any]] = []
+            try:
+                t_members = list(client.paginate(org, f"/orgs/{org}/teams/{slug}/members"))
+            except (GitHubAPIError, requests.RequestException) as exc:
+                LOG.warning("Could not list members for team %s/%s: %s", org, slug, exc)
+                team_errors.append((f"{org} (team {slug} members)", str(exc)))
+            t_repos: List[Dict[str, Any]] = []
+            try:
+                t_repos = list(client.paginate(org, f"/orgs/{org}/teams/{slug}/repos"))
+            except (GitHubAPIError, requests.RequestException) as exc:
+                LOG.warning("Could not list repositories for team %s/%s: %s", org, slug, exc)
+                team_errors.append((f"{org} (team {slug} repositories)", str(exc)))
+            return team, t_members, t_repos, team_errors
+
+        # Fetch team members and repositories concurrently
+        fetched_teams: List[Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, str]]]] = []
+        if teams:
+            with ThreadPoolExecutor(max_workers=min(8, max(2, len(teams))), thread_name_prefix="team-worker") as pool:
+                fetched_teams = list(pool.map(_fetch_team_details, teams))
+
+        for team, team_members, team_repositories, team_errors in fetched_teams:
+            if team_errors:
+                failures.extend(team_errors)
+                org_team_complete[org] = False
             slug = team.get("slug")
             name = team.get("name") or slug
             if not slug or not name:
-                failures.append((f"{org} (team entry)", "GitHub returned a team without a name or slug"))
-                org_team_complete[org] = False
                 continue
-            try:
-                team_members = list(client.paginate(org, f"/orgs/{org}/teams/{slug}/members"))
-            except (GitHubAPIError, requests.RequestException) as exc:
-                LOG.warning("Could not list members for team %s/%s: %s", org, slug, exc)
-                failures.append((f"{org} (team {slug} members)", str(exc)))
-                org_team_complete[org] = False
-                continue
+
             member_logins = {
                 member["login"] for member in team_members
                 if member.get("login") and not (exclude_bots and is_bot(member))
             }
             team_members_by_slug[slug.casefold()] = (name, member_logins)
-            try:
-                team_repositories = list(client.paginate(org, f"/orgs/{org}/teams/{slug}/repos"))
-            except (GitHubAPIError, requests.RequestException) as exc:
-                LOG.warning("Could not list repositories for team %s/%s: %s", org, slug, exc)
-                failures.append((f"{org} (team {slug} repositories)", str(exc)))
-                org_team_complete[org] = False
-                team_repositories = []
 
             team_streams: Set[str] = set()
             for repository in team_repositories:
@@ -1195,6 +1497,24 @@ class RunnerJobMetrics:
         return round(self.queue_sla_breaches / len(self.queue_durations) * 100, 2) if self.queue_durations else "N/A"
 
 
+def _merge_runner_metrics(dest: RunnerJobMetrics, src: RunnerJobMetrics) -> None:
+    dest.total_jobs += src.total_jobs
+    dest.successful_jobs += src.successful_jobs
+    dest.failed_jobs += src.failed_jobs
+    dest.timed_out_jobs += src.timed_out_jobs
+    dest.cancelled_jobs += src.cancelled_jobs
+    dest.other_jobs += src.other_jobs
+    dest.total_duration_seconds += src.total_duration_seconds
+    dest.total_queue_seconds += src.total_queue_seconds
+    dest.job_durations.extend(src.job_durations)
+    dest.queue_durations.extend(src.queue_durations)
+    dest.repos_served.update(src.repos_served)
+    if src.first_job_time:
+        dest.first_job_time = min(dest.first_job_time, src.first_job_time) if dest.first_job_time else src.first_job_time
+    if src.last_job_time:
+        dest.last_job_time = max(dest.last_job_time, src.last_job_time) if dest.last_job_time else src.last_job_time
+
+
 def collect_runners_and_metrics(
     client: GitHubClient,
     orgs: List[str],
@@ -1202,7 +1522,8 @@ def collect_runners_and_metrics(
     since: datetime,
     end: datetime,
     cfg: Config,
-    failures: List[Tuple[str, str]]
+    failures: List[Tuple[str, str]],
+    metadata_cache: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None
 ) -> Tuple[List[RunnerInfo], Dict[Tuple[str, str], RunnerJobMetrics], Dict[str, RunnerJobMetrics]]:
     runners: List[RunnerInfo] = []
     runner_metrics: Dict[Tuple[str, str], RunnerJobMetrics] = defaultdict(RunnerJobMetrics)
@@ -1256,34 +1577,66 @@ def collect_runners_and_metrics(
             else:
                 failures.append((f"{org} (Actions self-hosted runners)", reason))
 
+    # Filter targets to active repositories only (skip empty, dormant, or archived repos)
+    active_targets: List[Tuple[str, str]] = []
     for org, repo in targets:
+        meta = metadata_cache.get((org.casefold(), repo.casefold())) if metadata_cache else None
+        if meta:
+            if meta.get("archived") and not cfg.include_archived:
+                continue
+            if meta.get("size", 1) == 0:
+                continue
+            p_at = parse_ts(meta["pushed_at"]) if meta.get("pushed_at") else None
+            u_at = parse_ts(meta["updated_at"]) if meta.get("updated_at") else None
+            if p_at and p_at < since and u_at and u_at < since:
+                continue
+        active_targets.append((org, repo))
+
+    LOG.info("Checking Actions runner metrics on %d active repository targets (skipped %d dormant/empty repos)...",
+             len(active_targets), len(targets) - len(active_targets))
+
+    def _scan_repo_runner_activity(target: Tuple[str, str]) -> Tuple[
+        List[RunnerInfo],
+        Dict[Tuple[str, str], RunnerJobMetrics],
+        Dict[str, RunnerJobMetrics],
+        Optional[Tuple[str, str]]
+    ]:
+        org, repo = target
+        local_runners: List[RunnerInfo] = []
+        local_runner_metrics: Dict[Tuple[str, str], RunnerJobMetrics] = defaultdict(RunnerJobMetrics)
+        local_org_metrics: Dict[str, RunnerJobMetrics] = defaultdict(RunnerJobMetrics)
+        local_known_names = set(known_runner_names)
+        local_known_ids = set(known_runner_ids)
+        failure_item = None
+
+        # 1. Repo-level runners
         try:
             for item in client.paginate_enveloped(org, f"/repos/{org}/{repo}/actions/runners", "runners"):
                 if not isinstance(item, dict) or "id" not in item:
                     continue
                 r_id = item["id"]
                 name = item.get("name", f"runner-{r_id}")
-                os_name = item.get("os", "Unknown")
-                status = str(item.get("status", "unknown")).capitalize()
-                busy = bool(item.get("busy", False))
-                raw_labels = item.get("labels", [])
-                labels = tuple(sorted(l.get("name") for l in raw_labels if isinstance(l, dict) and l.get("name")))
-                arch = item.get("arch", "x64")
-                version = item.get("runner_version") or item.get("version") or "Unknown"
-                ephemeral = bool(item.get("ephemeral", False))
-                runners.append(RunnerInfo(
-                    id=r_id, name=name, os=os_name, status=status, busy=busy,
-                    labels=labels, runner_group_id=None, runner_group_name="Repository-level",
-                    org=org, repo=repo, arch=arch, runner_version=version, ephemeral=ephemeral
+                local_runners.append(RunnerInfo(
+                    id=r_id, name=name, os=item.get("os", "Unknown"),
+                    status=str(item.get("status", "unknown")).capitalize(),
+                    busy=bool(item.get("busy", False)),
+                    labels=tuple(sorted(l.get("name") for l in item.get("labels", []) if isinstance(l, dict) and l.get("name"))),
+                    runner_group_id=None, runner_group_name="Repository-level",
+                    org=org, repo=repo, arch=item.get("arch", "x64"),
+                    runner_version=item.get("runner_version") or item.get("version") or "Unknown",
+                    ephemeral=bool(item.get("ephemeral", False))
                 ))
-                known_runner_names.add(name.casefold())
-                known_runner_ids.add(r_id)
+                local_known_names.add(name.casefold())
+                local_known_ids.add(r_id)
         except (GitHubAPIError, requests.RequestException):
             pass
 
-    for org, repo in targets:
+        # 2. Completed workflow runs
         try:
             runs_checked = 0
+            consecutive_non_self_hosted = 0
+            has_seen_self_hosted = False
+
             for run_item in client.paginate_enveloped(org, f"/repos/{org}/{repo}/actions/runs", "workflow_runs", params={"status": "completed"}):
                 created_str = run_item.get("created_at") or run_item.get("run_started_at")
                 if not created_str:
@@ -1303,6 +1656,7 @@ def collect_runners_and_metrics(
                 except (GitHubAPIError, requests.RequestException):
                     continue
 
+                run_had_self_hosted = False
                 for job in jobs:
                     if not isinstance(job, dict):
                         continue
@@ -1312,16 +1666,18 @@ def collect_runners_and_metrics(
 
                     is_self_hosted = (
                         "self-hosted" in job_labels
-                        or (r_id and r_id in known_runner_ids)
-                        or (r_name and r_name.casefold() in known_runner_names)
+                        or (r_id and r_id in local_known_ids)
+                        or (r_name and r_name.casefold() in local_known_names)
                     )
                     if not is_self_hosted:
                         continue
 
+                    run_had_self_hosted = True
+                    has_seen_self_hosted = True
                     matched_runner_name = r_name or (f"runner-{r_id}" if r_id else "self-hosted-runner")
-                    if matched_runner_name.casefold() not in known_runner_names:
-                        known_runner_names.add(matched_runner_name.casefold())
-                        runners.append(RunnerInfo(
+                    if matched_runner_name.casefold() not in local_known_names:
+                        local_known_names.add(matched_runner_name.casefold())
+                        local_runners.append(RunnerInfo(
                             id=r_id or 0, name=matched_runner_name, os=job.get("os", "Linux"),
                             status="Ephemeral", busy=False, labels=tuple(job.get("labels", ["self-hosted"])),
                             runner_group_name=job.get("runner_group_name") or "Default",
@@ -1337,7 +1693,7 @@ def collect_runners_and_metrics(
                     duration_sec = max(0.0, (completed_at - started_at).total_seconds()) if (completed_at and started_at) else None
                     job_end = completed_at or started_at
 
-                    for metrics_bucket in (runner_metrics[(org, matched_runner_name)], org_runner_metrics[org]):
+                    for metrics_bucket in (local_runner_metrics[(org, matched_runner_name)], local_org_metrics[org]):
                         metrics_bucket.total_jobs += 1
                         metrics_bucket.repos_served.add(repo)
                         if conclusion == "success":
@@ -1367,10 +1723,35 @@ def collect_runners_and_metrics(
                                 max(metrics_bucket.last_job_time, job_end)
                                 if metrics_bucket.last_job_time else job_end
                             )
+
+                if not run_had_self_hosted and not has_seen_self_hosted:
+                    consecutive_non_self_hosted += 1
+                    # Repos using standard GitHub-hosted runners exit after 3 checks
+                    if consecutive_non_self_hosted >= 3:
+                        break
+
         except (GitHubAPIError, requests.RequestException) as exc:
             reason = str(exc)
             if not (isinstance(exc, GitHubAPIError) and exc.status in (403, 404)):
-                failures.append((f"{org}/{repo} (Actions jobs)", reason))
+                failure_item = (f"{org}/{repo} (Actions jobs)", reason)
+
+        return local_runners, local_runner_metrics, local_org_metrics, failure_item
+
+    # Execute repository runner collection in parallel across worker pool
+    with ThreadPoolExecutor(max_workers=cfg.max_workers, thread_name_prefix="runner-worker") as pool:
+        futures = {pool.submit(_scan_repo_runner_activity, target): target for target in active_targets}
+        for future in as_completed(futures):
+            loc_runners, loc_metrics, loc_org_metrics, failure_item = future.result()
+            if failure_item:
+                failures.append(failure_item)
+            for r in loc_runners:
+                if r.name.casefold() not in known_runner_names:
+                    known_runner_names.add(r.name.casefold())
+                    runners.append(r)
+            for key, m in loc_metrics.items():
+                _merge_runner_metrics(runner_metrics[key], m)
+            for o_key, o_m in loc_org_metrics.items():
+                _merge_runner_metrics(org_runner_metrics[o_key], o_m)
 
     return runners, runner_metrics, org_runner_metrics
 
@@ -1880,6 +2261,7 @@ def build_management_tables(reports: Dict[Tuple[str, str], RepositoryReport], me
         ["Summary", "Report Title", "Fixed report title."],
         ["Summary", "Reporting Period", "Lookback start and report end, formatted in IST."],
         ["Summary", "Generated", "Workbook generation timestamp in IST."],
+        ["Summary", "Total Execution Duration", "Total wall-clock elapsed time required to execute the collection and generate reports."],
         ["Summary", "Metric / Value", "Summary KPI name and calculated value; see the corresponding Management KPIs definition."],
         ["Summary", "Organization Breakdown: Organization", "Organization login."],
         ["Summary", "Organization Breakdown: Repositories Scanned", "Repositories with successfully collected activity results."],
@@ -2122,20 +2504,38 @@ def section_title(ws, row: int, title: str) -> int:
 
 
 
+def format_duration(seconds: Optional[float]) -> str:
+    """Format duration in seconds to a concise human-readable string (e.g. 45s, 14m 22s, 1h 12m 5s)."""
+    if seconds is None or seconds < 0:
+        return "N/A"
+    total_sec = int(round(seconds))
+    hours, remainder = divmod(total_sec, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{total_sec}s"
+
+
 def write_workbook(path: Path, cfg: Config, since: datetime, end: datetime, user_rows: List[list],
                    repo_rows: List[list], org_rows: List[list], failures: List[Tuple[str, str]],
                    repos_scanned: int,
                    management_tables: Optional[Dict[str, Tuple[Tuple[str, ...], List[list]]]] = None,
                    runner_rows: Optional[List[list]] = None,
-                   org_runner_rows: Optional[List[list]] = None) -> None:
+                   org_runner_rows: Optional[List[list]] = None,
+                   execution_duration: Optional[float] = None) -> None:
     wb = Workbook()
     summary = wb.active
     summary.title = "Summary"
     summary["A1"] = "GitHub User Activity Report"
     summary["A1"].font = Font(bold=True, size=16, color=NAVY)
     since_ist, end_ist = since.astimezone(IST), end.astimezone(IST)
+    duration_str = format_duration(execution_duration) if execution_duration is not None else None
+    duration_tag = f"  |  Execution Duration: {duration_str}" if duration_str else ""
     summary["A2"] = (f"Reporting period: {since_ist:{DATE_FMT}} to {end_ist:{DATE_FMT}} ({cfg.lookback_days} days)"
-                     f"  |  Generated: {end_ist:{DATE_FMT} %H:%M} IST")
+                     f"  |  Generated: {end_ist:{DATE_FMT} %H:%M} IST{duration_tag}")
     summary["A2"].font = Font(italic=True, color="595959")
 
     status_counts = Counter(row[STATUS_IDX] for row in user_rows)
@@ -2146,6 +2546,7 @@ def write_workbook(path: Path, cfg: Config, since: datetime, end: datetime, user
     total_compute_hours = sum(r[compute_idx] for r in (runner_rows or []) if len(r) > compute_idx and isinstance(r[compute_idx], (int, float)))
 
     kpis = [
+        ["Total Execution Duration", duration_str or "N/A"],
         ["Organizations", len(org_rows)],
         ["Repositories Scanned", repos_scanned],
         ["Items Not Processed", len(failures)],
@@ -2308,6 +2709,7 @@ def setup_logging(level: str, log_file: Path) -> None:
     console.setFormatter(ColorFormatter(console_fmt) if console_supports_color() else logging.Formatter(console_fmt))
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(threadName)s | %(message)s"))
+    LOG.handlers.clear()
     LOG.addHandler(console)
     LOG.addHandler(file_handler)
     LOG.setLevel(level)
@@ -2315,6 +2717,7 @@ def setup_logging(level: str, log_file: Path) -> None:
 
 
 def run(cfg: Config, end: datetime, stamp: str) -> int:
+    start_time = time.time()
     entries = load_repo_entries(cfg.repos_csv)
     history_file = cfg.history_file or cfg.output_dir / "adoption_history.json"
     history = load_history(history_file)
@@ -2328,16 +2731,25 @@ def run(cfg: Config, end: datetime, stamp: str) -> int:
         LOG.info("Loaded audit-log join events for %d organization(s)", len(audit_joined_users))
 
     client = GitHubClient(cfg)
-    targets, failures = resolve_targets(client, entries, cfg)
+    targets, failures, metadata_cache = resolve_targets(client, entries, cfg)
     if not targets:
         LOG.error("No repositories to scan")
         return 1
 
+    orgs = sorted({org for org, _ in targets}, key=str.lower)
+    org_custom_props = fetch_org_custom_properties(client, orgs)
+
     reports: Dict[Tuple[str, str], RepositoryReport] = {}
     with ThreadPoolExecutor(max_workers=cfg.max_workers, thread_name_prefix="worker") as pool:
-        futures = {pool.submit(collect_repository, client, org, repo, since, end, cfg.exclude_bots,
-                       cfg.value_stream_property): (org, repo)
-                   for org, repo in targets}
+        futures = {
+            pool.submit(
+                collect_repository, client, org, repo, since, end, cfg.exclude_bots,
+                cfg.value_stream_property,
+                metadata_cache.get((org.casefold(), repo.casefold())),
+                org_custom_props.get((org.casefold(), repo.casefold()))
+            ): (org, repo)
+            for org, repo in targets
+        }
         for done, future in enumerate(as_completed(futures), start=1):
             org, repo = futures[future]
             try:
@@ -2352,7 +2764,6 @@ def run(cfg: Config, end: datetime, stamp: str) -> int:
                 LOG.error("[%d/%d] %s/%s failed: %s", done, len(targets), org, repo, exc)
                 failures.append((f"{org}/{repo}", str(exc)))
 
-    orgs = sorted({org for org, _ in targets}, key=str.lower)
     members = fetch_members(client, orgs, cfg.exclude_bots, failures)
     teams_by_user, team_streams_by_user, org_team_complete = fetch_team_access(
         client, orgs, reports, cfg.exclude_bots, failures, cfg.value_stream_property)
@@ -2364,7 +2775,7 @@ def run(cfg: Config, end: datetime, stamp: str) -> int:
     if cfg.include_runner_metrics:
         LOG.info("Collecting Actions self-hosted runner metrics across %d organization(s)...", len(orgs))
         runners, runner_metrics, org_runner_metrics = collect_runners_and_metrics(
-            client, orgs, targets, since, end, cfg, failures
+            client, orgs, targets, since, end, cfg, failures, metadata_cache
         )
         runner_rows, org_runner_rows = build_runner_rows(runners, runner_metrics, org_runner_metrics, orgs)
         LOG.info("Actions runner metrics: %d self-hosted runner(s) processed", len(runners))
@@ -2403,25 +2814,30 @@ def run(cfg: Config, end: datetime, stamp: str) -> int:
     csv_path = cfg.output_dir / f"{cfg.file_prefix}_{stamp}.csv"
     xlsx_path = cfg.output_dir / f"{cfg.file_prefix}_{stamp}.xlsx"
     write_csv(csv_path, USER_HEADERS, user_rows)
+    elapsed_duration = time.time() - start_time
     write_workbook(xlsx_path, cfg, since, end, user_rows, repo_rows, org_rows, failures, len(results),
-                   management_tables, runner_rows=runner_rows, org_runner_rows=org_runner_rows)
+                   management_tables, runner_rows=runner_rows, org_runner_rows=org_runner_rows,
+                   execution_duration=elapsed_duration)
     if complete:
         save_history(history_file, history)
     else:
         LOG.warning("Partial run: adoption history was not updated; management metrics may be incomplete")
 
+    duration_str = format_duration(elapsed_duration)
     LOG.info("CSV report : %s", csv_path)
     LOG.info("XLSX report: %s", xlsx_path)
+    LOG.info("Total execution duration: %s (%.1f seconds)", duration_str, elapsed_duration)
     if failures:
         LOG.warning("Completed with %d item(s) not processed - see Summary sheet", len(failures))
         return 2
-    LOG.info("Completed successfully: %d users across %d repositories", len(user_rows), len(results))
+    LOG.info("Completed successfully: %d users across %d repositories in %s", len(user_rows), len(results), duration_str)
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="GitHub user activity report via GitHub App.")
-    parser.add_argument("--config", default="config.json", type=Path, help="Path to config JSON (default: config.json)")
+    parser.add_argument("--config", default=Path("config.json"), type=Path,
+                        help="Path to config JSON file (default: config.json)")
     args = parser.parse_args()
 
     end = datetime.now(timezone.utc)
@@ -2430,9 +2846,11 @@ def main() -> int:
         cfg = load_config(args.config)
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
         setup_logging(cfg.log_level, cfg.output_dir / f"{cfg.file_prefix}_{stamp}.log")
+        LOG.info("Configuration : %s", args.config)
+        LOG.info("Target API    : %s", cfg.api_url)
         return run(cfg, end, stamp)
     except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+        print(f"Configuration error in {args.config}: {exc}", file=sys.stderr)
         return 1
     except (GitHubAPIError, requests.RequestException, OSError) as exc:
         LOG.critical("Fatal error: %s", exc)
@@ -2441,6 +2859,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
+
 
 if __name__ == "__main__":
     sys.exit(main())
